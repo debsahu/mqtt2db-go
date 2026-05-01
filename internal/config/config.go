@@ -113,9 +113,9 @@ type MetricsConfig struct {
 
 // HealthConfig configures liveness/readiness endpoints.
 type HealthConfig struct {
-	Listen         string `yaml:"listen"          env:"LISTEN"`
-	LivenessPath   string `yaml:"liveness_path"   env:"LIVENESS_PATH"`
-	ReadinessPath  string `yaml:"readiness_path"  env:"READINESS_PATH"`
+	Listen        string `yaml:"listen"          env:"LISTEN"`
+	LivenessPath  string `yaml:"liveness_path"   env:"LIVENESS_PATH"`
+	ReadinessPath string `yaml:"readiness_path"  env:"READINESS_PATH"`
 }
 
 // LoggingConfig configures slog initialisation.

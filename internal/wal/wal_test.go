@@ -17,7 +17,7 @@ import (
 	"github.com/debsahu/mqtt2db-go/internal/wal"
 )
 
-func newStore(t *testing.T, ttl time.Duration) (*wal.Store, *metrics.WALMetrics, string) {
+func newStore(t *testing.T, ttl time.Duration) (*wal.Store, *metrics.WALMetrics) {
 	t.Helper()
 	dir := t.TempDir()
 	reg := metrics.NewRegistry()
@@ -32,7 +32,7 @@ func newStore(t *testing.T, ttl time.Duration) (*wal.Store, *metrics.WALMetrics,
 	t.Cleanup(func() {
 		_ = s.Close()
 	})
-	return s, m, dir
+	return s, m
 }
 
 func makeMsg(seq int) postgres.Message {
@@ -57,7 +57,7 @@ func TestOpen_RejectsEmptyPath(t *testing.T) {
 }
 
 func TestAppendDrain_PreservesOrder(t *testing.T) {
-	s, m, _ := newStore(t, 0)
+	s, m := newStore(t, 0)
 
 	for i := 0; i < 50; i++ {
 		_, err := s.Append(makeMsg(i))
@@ -81,7 +81,7 @@ func TestAppendDrain_PreservesOrder(t *testing.T) {
 }
 
 func TestDrain_RespectsLimit(t *testing.T) {
-	s, _, _ := newStore(t, 0)
+	s, _ := newStore(t, 0)
 	for i := 0; i < 20; i++ {
 		_, err := s.Append(makeMsg(i))
 		require.NoError(t, err)
@@ -107,7 +107,7 @@ func TestDrain_RespectsLimit(t *testing.T) {
 }
 
 func TestDrain_ZeroLimitReturnsEmpty(t *testing.T) {
-	s, _, _ := newStore(t, 0)
+	s, _ := newStore(t, 0)
 	_, err := s.Append(makeMsg(0))
 	require.NoError(t, err)
 
@@ -151,7 +151,7 @@ func TestRestart_PersistsAcrossClose(t *testing.T) {
 
 func TestTTL_ExpiresEntries(t *testing.T) {
 	// Tight TTL: entries expire within 200ms.
-	s, m, _ := newStore(t, 100*time.Millisecond)
+	s, m := newStore(t, 100*time.Millisecond)
 	for i := 0; i < 5; i++ {
 		_, err := s.Append(makeMsg(i))
 		require.NoError(t, err)
@@ -170,7 +170,7 @@ func TestTTL_ExpiresEntries(t *testing.T) {
 }
 
 func TestRefreshMetrics_TracksEntriesAndOldestAge(t *testing.T) {
-	s, m, _ := newStore(t, 0)
+	s, m := newStore(t, 0)
 
 	require.NoError(t, s.RefreshMetrics())
 	assert.Equal(t, float64(0), testutil.ToFloat64(m.Entries))
@@ -192,7 +192,7 @@ func TestRefreshMetrics_TracksEntriesAndOldestAge(t *testing.T) {
 }
 
 func TestAppend_Concurrent(t *testing.T) {
-	s, m, _ := newStore(t, 0)
+	s, m := newStore(t, 0)
 
 	const writers = 4
 	const perWriter = 250

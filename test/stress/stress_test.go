@@ -3,21 +3,22 @@
 // Self-contained stress test for the mqtt2db-go pipeline.
 //
 // What it does:
-//   1. Spins up Comqtt v2.6.2 (locally-built), Postgres 17, RustFS via
-//      testcontainers — same images the integration tests use.
-//   2. Runs migrations.
-//   3. Starts the full in-process pipeline (ring buffer + WAL + flusher
-//      + dead-letter sink + subscriber) with production-shaped config.
-//   4. Drives load through 8 parallel publishers at a configurable rate
-//      for a configurable duration.
-//   5. Reports messages_sent, messages_persisted, achieved_rate,
-//      end-to-end latency p50/p95/p99 (received_at -> Postgres
-//      inserted_at), dead-letter count, and per-mode time spent.
-//   6. Asserts no message loss: persisted == sent.
+//  1. Spins up Comqtt v2.6.2 (locally-built), Postgres 17, RustFS via
+//     testcontainers — same images the integration tests use.
+//  2. Runs migrations.
+//  3. Starts the full in-process pipeline (ring buffer + WAL + flusher
+//     + dead-letter sink + subscriber) with production-shaped config.
+//  4. Drives load through 8 parallel publishers at a configurable rate
+//     for a configurable duration.
+//  5. Reports messages_sent, messages_persisted, achieved_rate,
+//     end-to-end latency p50/p95/p99 (received_at -> Postgres
+//     inserted_at), dead-letter count, and per-mode time spent.
+//  6. Asserts no message loss: persisted == sent.
 //
 // Run with:
-//   STRESS_RATE=2000 STRESS_DURATION=30s STRESS_DEVICES=500 \
-//       go test -tags=stress -timeout=10m -v -run='^TestStress$' ./test/stress/
+//
+//	STRESS_RATE=2000 STRESS_DURATION=30s STRESS_DEVICES=500 \
+//	    go test -tags=stress -timeout=10m -v -run='^TestStress$' ./test/stress/
 //
 // The defaults are conservative so this can run on a laptop in 30s.
 // CI can override the env vars for nightly runs.
@@ -96,11 +97,11 @@ func migrationsDir(tb testing.TB) string {
 func startComqtt(tb testing.TB, ctx context.Context) string {
 	tb.Helper()
 	req := testcontainers.ContainerRequest{
-		Image:        "comqtt:v2.6.2",
+		Image:         "comqtt:v2.6.2",
 		ImagePlatform: "linux/" + runtime.GOARCH,
-		ExposedPorts: []string{"1883/tcp"},
-		Cmd:          []string{"--tcp=:1883", "--ws=:1882", "--http=:8080"},
-		WaitingFor:   wait.ForListeningPort("1883/tcp").WithStartupTimeout(60 * time.Second),
+		ExposedPorts:  []string{"1883/tcp"},
+		Cmd:           []string{"--tcp=:1883", "--ws=:1882", "--http=:8080"},
+		WaitingFor:    wait.ForListeningPort("1883/tcp").WithStartupTimeout(60 * time.Second),
 	}
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,

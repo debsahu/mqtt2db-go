@@ -57,7 +57,7 @@ type WAL interface {
 }
 
 // Subscriber wires paho.golang/autopaho to the ring + WAL. Start blocks
-// until ctx is cancelled.
+// until ctx is canceled.
 type Subscriber struct {
 	cfg    config.MQTTConfig
 	ring   Ring
@@ -124,7 +124,7 @@ func (s *Subscriber) Start(ctx context.Context) error {
 		// MQTT 5 session expiry — we want sessions to survive at least the
 		// length of MaxReconnectBackoff so a flapping deploy doesn't lose
 		// messages queued for our client.
-		SessionExpiryInterval: uint32(s.cfg.MaxReconnectBackoff.AsDuration().Seconds()),
+		SessionExpiryInterval:         uint32(s.cfg.MaxReconnectBackoff.AsDuration().Seconds()),
 		CleanStartOnInitialConnection: s.cfg.CleanSession,
 
 		ConnectUsername: s.cfg.Username,
@@ -137,8 +137,8 @@ func (s *Subscriber) Start(ctx context.Context) error {
 		},
 
 		ClientConfig: paho.ClientConfig{
-			ClientID:        s.clientID,
-			Session:         nil, // autopaho manages
+			ClientID: s.clientID,
+			Session:  nil, // autopaho manages
 			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
 				s.onPublish,
 			},

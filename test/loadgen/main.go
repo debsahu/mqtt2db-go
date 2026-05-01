@@ -1,4 +1,4 @@
-// Command loadgen synthesises MQTT traffic against a broker so we can
+// Command loadgen synthesizes MQTT traffic against a broker so we can
 // stress mqtt2db-go end-to-end. It publishes per-device QoS 1 messages
 // at a configurable rate and reports achieved throughput plus an
 // approximation of end-to-end latency (round-trip via a sentinel topic
@@ -30,6 +30,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	var (
 		broker      string
 		rate        int
@@ -55,8 +62,7 @@ func main() {
 	flag.Parse()
 
 	if rate <= 0 || duration <= 0 || devices <= 0 || clients <= 0 {
-		fmt.Fprintf(os.Stderr, "rate, duration, devices, clients must all be > 0\n")
-		os.Exit(1)
+		return fmt.Errorf("rate, duration, devices, clients must all be > 0")
 	}
 
 	deviceIDs := make([]uuid.UUID, devices)
@@ -66,8 +72,7 @@ func main() {
 
 	bu, err := url.Parse(broker)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse broker: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("parse broker: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
@@ -86,12 +91,10 @@ func main() {
 			ClientConfig:    paho.ClientConfig{ClientID: fmt.Sprintf("loadgen-%s", uuid.NewString()[:8])},
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "connect publisher %d: %v\n", i, err)
-			os.Exit(1)
+			return fmt.Errorf("connect publisher %d: %w", i, err)
 		}
 		if err := cm.AwaitConnection(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "await publisher %d: %v\n", i, err)
-			os.Exit(1)
+			return fmt.Errorf("await publisher %d: %w", i, err)
 		}
 		publishers[i] = cm
 		defer func(c *autopaho.ConnectionManager) {
@@ -113,7 +116,9 @@ func main() {
 		wg.Add(1)
 		go func(idx int, cm *autopaho.ConnectionManager) {
 			defer wg.Done()
-			r := rand.New(rand.NewSource(time.Now().UnixNano() ^ int64(idx)))
+			// Deterministic-but-cheap PRNG; we are not generating
+			// security-sensitive payloads here.
+			r := rand.New(rand.NewSource(time.Now().UnixNano() ^ int64(idx))) //nolint:gosec
 			interval := time.Second / time.Duration(perClient)
 			next := time.Now()
 			body := make([]byte, payload)
@@ -155,4 +160,5 @@ func main() {
 	fmt.Printf("  publish errors   : %d\n", errs.Load())
 	fmt.Printf("  achieved rate    : %.0f msg/s (%.1f%% of target)\n",
 		achievedRate, achievedRate/float64(rate)*100)
+	return nil
 }

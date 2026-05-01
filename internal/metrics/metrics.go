@@ -169,14 +169,14 @@ func NewSubscriberMetrics(reg prometheus.Registerer) *SubscriberMetrics {
 
 // FlusherMetrics is the metric set the adaptive flusher exports.
 type FlusherMetrics struct {
-	BatchSize       prometheus.Gauge     // currently active batch size (mode-aware)
-	Mode            prometheus.Gauge     // 0=normal, 1=elevated, 2=critical
-	FlushLatency    prometheus.Histogram // seconds per Postgres flush
-	Flushed         prometheus.Counter   // batches flushed successfully
-	Inserted        prometheus.Counter   // rows actually inserted (post-dedup)
-	FlushErrors     prometheus.Counter   // batch flushes that errored
-	RetriesTotal    prometheus.Counter   // total per-batch retry attempts
-	DeadLettered    prometheus.Counter   // messages handed off to dead-letter
+	BatchSize    prometheus.Gauge     // currently active batch size (mode-aware)
+	Mode         prometheus.Gauge     // 0=normal, 1=elevated, 2=critical
+	FlushLatency prometheus.Histogram // seconds per Postgres flush
+	Flushed      prometheus.Counter   // batches flushed successfully
+	Inserted     prometheus.Counter   // rows actually inserted (post-dedup)
+	FlushErrors  prometheus.Counter   // batch flushes that errored
+	RetriesTotal prometheus.Counter   // total per-batch retry attempts
+	DeadLettered prometheus.Counter   // messages handed off to dead-letter
 }
 
 // NewFlusherMetrics registers the flusher metric set on reg.

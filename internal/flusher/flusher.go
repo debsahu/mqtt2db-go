@@ -87,10 +87,10 @@ type Flusher struct {
 	// adaptive state
 	mu             sync.Mutex
 	mode           Mode
-	belowSince     time.Time          // when latency dropped below elevated threshold
-	criticalUntil  time.Time          // earliest time we may try again from critical
-	latencyWindow  []time.Duration    // recent flush latencies for p95
-	windowCapacity int                // size of the rolling window
+	belowSince     time.Time       // when latency dropped below elevated threshold
+	criticalUntil  time.Time       // earliest time we may try again from critical
+	latencyWindow  []time.Duration // recent flush latencies for p95
+	windowCapacity int             // size of the rolling window
 
 	// allow injecting a clock for tests
 	now func() time.Time
@@ -135,7 +135,7 @@ func New(
 	}, nil
 }
 
-// Run blocks until ctx is cancelled. Each tick pulls up to BatchSize from
+// Run blocks until ctx is canceled. Each tick pulls up to BatchSize from
 // the source (and the WAL if non-nil), flushes once, and updates mode
 // based on observed latency.
 func (f *Flusher) Run(ctx context.Context) error {
@@ -161,7 +161,7 @@ func (f *Flusher) Run(ctx context.Context) error {
 			continue
 		}
 
-		batch := f.pullBatch(ctx)
+		batch := f.pullBatch()
 		if len(batch) == 0 {
 			timer.Reset(f.flushIntervalForMode())
 			continue
@@ -174,7 +174,7 @@ func (f *Flusher) Run(ctx context.Context) error {
 
 // pullBatch reads from the ring first and tops up from the WAL if there's
 // headroom. Bounded by the active batch size.
-func (f *Flusher) pullBatch(ctx context.Context) []postgres.Message {
+func (f *Flusher) pullBatch() []postgres.Message {
 	batchSize := f.batchSizeForMode()
 	out := f.src.Dequeue(batchSize)
 	if f.wal != nil && len(out) < batchSize {
@@ -293,16 +293,17 @@ func (f *Flusher) recordLatency(d time.Duration) {
 			f.setModeLocked(ModeElevated)
 		}
 	case ModeElevated:
-		if p95 >= f.cfg.CriticalLatencyThreshold.AsDuration() {
+		switch {
+		case p95 >= f.cfg.CriticalLatencyThreshold.AsDuration():
 			f.setModeLocked(ModeCritical)
-		} else if p95 < f.cfg.ElevatedLatencyThreshold.AsDuration() {
+		case p95 < f.cfg.ElevatedLatencyThreshold.AsDuration():
 			if f.belowSince.IsZero() {
 				f.belowSince = f.now()
 			} else if f.now().Sub(f.belowSince) >= f.cfg.RecoveryWindow.AsDuration() {
 				f.setModeLocked(ModeNormal)
 				f.belowSince = time.Time{}
 			}
-		} else {
+		default:
 			f.belowSince = time.Time{}
 		}
 	case ModeCritical:

@@ -268,7 +268,11 @@ func (s *Store) makeKey(at time.Time) []byte {
 	var b bytes.Buffer
 	b.Grow(len(keyPrefix) + 20 + 1 + 20)
 	b.WriteString(keyPrefix)
-	writePadded20(&b, uint64(at.UnixNano()))
+	// at.UnixNano() returns int64. For wall-clock times after 1970-01-01
+	// it is non-negative; service operates in 2026+, so the conversion is
+	// always safe. The cast just selects the unsigned width writePadded20
+	// expects.
+	writePadded20(&b, uint64(at.UnixNano())) //nolint:gosec
 	b.WriteByte(':')
 	writePadded20(&b, seq)
 	return b.Bytes()
@@ -304,7 +308,7 @@ func parseKeyTime(key []byte) (int64, bool) {
 	return nanos, true
 }
 
-// encodeMessage serialises a postgres.Message to bytes via gob. Gob is the
+// encodeMessage serializes a postgres.Message to bytes via gob. Gob is the
 // path of least resistance: stdlib, schema-flexible, and faster than JSON
 // for binary payloads. We do not pretend to support cross-language WAL
 // readers; this is a private on-disk format.

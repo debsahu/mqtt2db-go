@@ -24,11 +24,11 @@ import (
 )
 
 type fakeS3 struct {
-	mu       sync.Mutex
-	puts     []putRecord
-	putErr   error
-	headOK   bool
-	headErr  error
+	mu      sync.Mutex
+	puts    []putRecord
+	putErr  error
+	headOK  bool
+	headErr error
 }
 
 type putRecord struct {

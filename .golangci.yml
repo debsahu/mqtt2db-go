@@ -32,6 +32,12 @@ linters-settings:
   gosec:
     excludes:
       - G104
+  misspell:
+    locale: US
+    ignore-words:
+      # Mosquitto is the canonical name of the eclipse-mosquitto broker;
+      # misspell defaults flag it as a typo of "mosquito".
+      - mosquitto
   revive:
     rules:
       - name: var-naming

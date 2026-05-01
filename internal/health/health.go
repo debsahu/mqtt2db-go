@@ -71,7 +71,7 @@ func (s *Server) Register(name string, p Probe) {
 	s.probes[name] = p
 }
 
-// Run blocks until ctx is cancelled, then shuts the HTTP listener down
+// Run blocks until ctx is canceled, then shuts the HTTP listener down
 // cleanly with a 5s grace period.
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()

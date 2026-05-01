@@ -4,9 +4,9 @@
 // runs the full pipeline (subscriber -> ring -> flusher -> Postgres),
 // publishes 500 messages from a load generator, and asserts:
 //
-//   1. Every message lands in telemetry exactly once (dedup_key unique).
-//   2. The buffer / WAL / flusher metrics moved.
-//   3. The subscriber acked everything it received.
+//  1. Every message lands in telemetry exactly once (dedup_key unique).
+//  2. The buffer / WAL / flusher metrics moved.
+//  3. The subscriber acked everything it received.
 //
 // This is the "does the contract hold" test. It is intentionally slow
 // (~30s per run) because it stands up real brokers, a real database, and
@@ -202,7 +202,7 @@ func TestE2E_FullPipelinePersistsToPostgres(t *testing.T) {
 
 	t.Setenv("HOSTNAME", "e2e-host")
 	sub, err := subscriber.New(config.MQTTConfig{
-		Brokers: []string{broker},
+		Brokers:             []string{broker},
 		ClientIDPrefix:      "mqtt2db-go-e2e",
 		SharedSubscription:  "$share/ingest/t/+/d/+/evt/#",
 		Keepalive:           config.Duration(10 * time.Second),
@@ -305,4 +305,3 @@ func TestE2E_PgUnreachable_DeadLetters(t *testing.T) {
 	}
 	_ = s3types.NoSuchBucket{} // keep s3types referenced for import
 }
-

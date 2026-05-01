@@ -123,7 +123,7 @@ type envelope struct {
 	LastError  string    `json:"last_error,omitempty"`
 }
 
-// Write serialises msg with optional lastErr and uploads to S3.
+// Write serializes msg with optional lastErr and uploads to S3.
 func (s *Sink) Write(ctx context.Context, msg postgres.Message, lastErr error) error {
 	now := time.Now().UTC()
 	env := envelope{

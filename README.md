@@ -25,6 +25,19 @@ Devices --MQTT--> Comqtt cluster --shared sub--> mqtt2db-go --> PgBouncer --> Po
 
 Off-the-shelf options for moving MQTT data into PostgreSQL fall into two camps. Either you adopt a heavyweight broker like EMQX with bundled rule engine and database sinks (which couples ingest to the broker hot path and creates licensing risk), or you wire up Telegraf or NiFi (which work but offer little control over backpressure and dead-letter semantics). This service occupies the middle ground: a focused Go binary that does one thing well, with operational properties tuned for IoT telemetry at scale.
 
+## Container Image
+
+Multi-arch (linux/amd64 + linux/arm64) images are published to GitHub
+Container Registry on every push to `main` and on every `vX.Y.Z` tag:
+
+```
+ghcr.io/debsahu/mqtt2db-go:latest      # tracks main
+ghcr.io/debsahu/mqtt2db-go:sha-<7>     # commit-pinned
+ghcr.io/debsahu/mqtt2db-go:0.1.0       # release-pinned
+```
+
+The Helm chart's default `image.repository` already points there.
+
 ## Quickstart
 
 ```bash

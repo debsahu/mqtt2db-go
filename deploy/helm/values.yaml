@@ -2,7 +2,9 @@
 # Override per environment with `helm install -f values.prod.yaml`.
 
 image:
-  repository: mqtt2db-go
+  # Published from .github/workflows/release.yml on every main push and
+  # vX.Y.Z tag. Pin the tag to a sha-<short> or a semver in production.
+  repository: ghcr.io/debsahu/mqtt2db-go
   tag: ""           # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 

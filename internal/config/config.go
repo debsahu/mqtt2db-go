@@ -192,7 +192,9 @@ func Load(path string) (Config, error) {
 	cfg := NewDefault()
 
 	if path != "" {
-		raw, err := os.ReadFile(path)
+		// path comes from the operator-set --config flag, not from
+		// untrusted input — gosec G304 is a false positive here.
+		raw, err := os.ReadFile(path) //nolint:gosec
 		if err != nil {
 			return Config{}, fmt.Errorf("read config %q: %w", path, err)
 		}

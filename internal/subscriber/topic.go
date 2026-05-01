@@ -10,7 +10,7 @@ import (
 // ErrBadTopic is returned by ParseTopic when a topic does not match the
 // configured pattern. We do not silently drop these — they are surfaced as
 // HandlerErrors so operators can spot device firmware bugs.
-var ErrBadTopic = errors.New("subscriber: topic does not match t/{tenant}/d/{device_uuid}/evt/...")
+var ErrBadTopic = errors.New("subscriber: topic does not match t/{tenant}/d/{device_uuid}/evt/")
 
 // ParsedTopic carries the tenant ID and device UUID extracted from an
 // incoming MQTT topic. The topic pattern is hard-coded to match the

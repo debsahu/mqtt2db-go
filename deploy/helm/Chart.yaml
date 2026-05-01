@@ -1,0 +1,20 @@
+apiVersion: v2
+name: mqtt2db-go
+description: Subscribe to MQTT 5 shared subscriptions and persist to PostgreSQL via PgBouncer.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/debsahu/mqtt2db-go
+sources:
+  - https://github.com/debsahu/mqtt2db-go
+annotations:
+  artifacthub.io/license: MIT
+maintainers:
+  - name: Debashish Sahu
+    email: debashish.sahu@gmail.com
+    url: https://github.com/debsahu
+keywords:
+  - mqtt
+  - postgres
+  - iot
+  - ingestion

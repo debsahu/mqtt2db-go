@@ -1,0 +1,66 @@
+# Example configuration for mqtt2db-go.
+#
+# Copy this file to config.dev.yaml (gitignored) for local development, or
+# render it through your config-management system for production. Anything
+# not set here falls back to the built-in defaults documented in
+# docs/CONFIGURATION.md. Secrets should come from environment variables
+# (MQTT2DB_*) rather than this file.
+
+mqtt:
+  brokers:
+    - tcp://localhost:1883
+  shared_subscription: $share/ingest/t/+/d/+/evt/#
+  client_id_prefix: mqtt2db-go
+  username: ingest
+  password: ingest          # override via MQTT2DB_MQTT_PASSWORD in real deployments
+
+buffer:
+  max_messages: 100000
+  max_bytes: 104857600
+  spill_threshold: 0.8
+  pause_threshold: 0.95
+
+badger:
+  path: ./var/wal           # use /var/lib/mqtt2db-go/wal in production (PVC)
+  ttl: 168h
+  sync_writes: true
+
+postgres:
+  dsn: postgres://ingest:ingest@localhost:6432/telemetry?sslmode=disable
+  max_conns: 10
+  schema: public
+  table: telemetry
+
+flusher:
+  batch_size: 1000
+  flush_interval: 100ms
+  elevated_latency_threshold: 500ms
+  elevated_batch_size: 5000
+  elevated_flush_interval: 500ms
+  critical_latency_threshold: 2s
+  recovery_window: 60s
+  max_retries: 5
+
+dead_letter:
+  s3:
+    bucket: mqtt2db-go-dlq
+    region: us-east-1
+    endpoint: http://localhost:9000   # RustFS in dev; leave empty for AWS S3
+    use_path_style: true              # true for RustFS / non-AWS endpoints
+    use_ssl: false                    # http endpoint above
+    access_key: rustfsadmin
+    secret_key: rustfsadmin
+
+metrics:
+  listen: :9090
+  path: /metrics
+
+health:
+  listen: :8080
+  liveness_path: /healthz
+  readiness_path: /readyz
+
+logging:
+  level: info
+  format: json
+  log_payloads: false

@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mqtt2db-go.fullname" . }}
+  labels: {{- include "mqtt2db-go.labels" . | nindent 4 }}
+spec:
+  # StatefulSet (not Deployment) so each replica gets a stable pod name.
+  # That pod name becomes the MQTT client ID, which is non-negotiable
+  # for at-least-once delivery — see CLAUDE.md "MQTT subscriber".
+  serviceName: {{ include "mqtt2db-go.fullname" . }}
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "mqtt2db-go.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "mqtt2db-go.selectorLabels" . | nindent 8 }}
+      annotations: {{- toYaml .Values.podAnnotations | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "mqtt2db-go.serviceAccountName" . }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: mqtt2db-go
+          image: {{ include "mqtt2db-go.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--config=/etc/mqtt2db-go/config.yaml"
+          ports:
+            - name: metrics
+              containerPort: 9090
+            - name: health
+              containerPort: 8080
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - secretRef:
+                name: {{ include "mqtt2db-go.secretName" . }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.config.health.liveness_path | default "/healthz" }}
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.config.health.readiness_path | default "/readyz" }}
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mqtt2db-go
+              readOnly: true
+            - name: wal
+              mountPath: {{ .Values.config.badger.path }}
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "mqtt2db-go.fullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: wal
+      spec:
+        accessModes: [ {{ .Values.walVolume.accessMode | quote }} ]
+        {{- if .Values.walVolume.storageClass }}
+        storageClassName: {{ .Values.walVolume.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.walVolume.size }}

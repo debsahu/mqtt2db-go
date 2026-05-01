@@ -1,0 +1,14 @@
+{{- if .Values.serviceMonitor.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "mqtt2db-go.fullname" . }}
+  labels: {{- include "mqtt2db-go.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "mqtt2db-go.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: {{ .Values.config.metrics.path | default "/metrics" }}
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

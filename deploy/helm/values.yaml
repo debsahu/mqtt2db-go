@@ -1,0 +1,116 @@
+# Default values for mqtt2db-go.
+# Override per environment with `helm install -f values.prod.yaml`.
+
+image:
+  repository: mqtt2db-go
+  tag: ""           # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# Replica count. Each replica is a StatefulSet pod with stable identity
+# (the pod name becomes the MQTT client ID, which is non-negotiable for
+# at-least-once delivery — see CLAUDE.md).
+replicaCount: 3
+
+# StatefulSet PVC for the Badger WAL volume.
+walVolume:
+  storageClass: ""   # use cluster default if empty
+  size: 10Gi
+  accessMode: ReadWriteOnce
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# Pod-level config. mqtt.brokers, postgres.dsn, dead_letter.s3 must be
+# set per environment. Sensitive values come from a Kubernetes Secret
+# (see secret.* below).
+config:
+  mqtt:
+    brokers: []
+    client_id_prefix: mqtt2db-go
+    shared_subscription: $share/ingest/t/+/d/+/evt/#
+  buffer:
+    max_messages: 100000
+    max_bytes: 104857600
+    spill_threshold: 0.8
+    pause_threshold: 0.95
+  badger:
+    path: /var/lib/mqtt2db-go/wal
+    ttl: 168h
+    sync_writes: true
+  postgres:
+    dsn: ""
+    max_conns: 10
+    schema: public
+    table: telemetry
+  flusher:
+    batch_size: 1000
+    flush_interval: 100ms
+    max_retries: 5
+  dead_letter:
+    s3:
+      bucket: ""
+      region: us-east-1
+      endpoint: ""
+      use_path_style: false
+      use_ssl: true
+  metrics:
+    listen: ":9090"
+    path: /metrics
+  health:
+    listen: ":8080"
+    liveness_path: /healthz
+    readiness_path: /readyz
+  logging:
+    level: info
+    format: json
+
+# Existing secret with the runtime credentials. Required keys:
+#   MQTT2DB_MQTT_USERNAME
+#   MQTT2DB_MQTT_PASSWORD
+#   MQTT2DB_POSTGRES_DSN
+#   MQTT2DB_DEAD_LETTER_S3_ACCESS_KEY    (optional; IRSA preferred)
+#   MQTT2DB_DEAD_LETTER_S3_SECRET_KEY    (optional; IRSA preferred)
+secret:
+  existingName: ""
+  # If existingName is empty, set 'create: true' and provide values
+  # below. Production deployments should use existingName + ESO/SealedSecret.
+  create: false
+  data: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: /metrics
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+
+prometheusRule:
+  enabled: false
+  rules: []

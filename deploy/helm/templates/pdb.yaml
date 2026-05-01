@@ -1,0 +1,11 @@
+{{- if .Values.podDisruptionBudget.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "mqtt2db-go.fullname" . }}
+  labels: {{- include "mqtt2db-go.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels: {{- include "mqtt2db-go.selectorLabels" . | nindent 6 }}
+{{- end }}

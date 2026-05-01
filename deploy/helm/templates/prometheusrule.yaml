@@ -1,0 +1,11 @@
+{{- if and .Values.prometheusRule.enabled .Values.prometheusRule.rules -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "mqtt2db-go.fullname" . }}
+  labels: {{- include "mqtt2db-go.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: mqtt2db-go.rules
+      rules: {{- toYaml .Values.prometheusRule.rules | nindent 8 }}
+{{- end }}

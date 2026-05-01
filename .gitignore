@@ -1,0 +1,43 @@
+# Local AI assistant context — kept out of git
+CLAUDE.md
+
+# Internal design docs — kept out of the public repo
+docs/
+
+# macOS
+.DS_Store
+
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go
+vendor/
+coverage.out
+coverage.html
+go.work
+go.work.sum
+
+# Local config and secrets
+config.dev.yaml
+config.local.yaml
+*.local.yaml
+.env
+.env.*
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local Badger / dev artifacts
+/var/
+/tmp/
+*.badger/
+
+# Misc archives
+files.zip

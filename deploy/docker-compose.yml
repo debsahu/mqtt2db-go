@@ -1,0 +1,123 @@
+# Local development stack for mqtt2db-go.
+# Brings up Comqtt (built from upstream source via deploy/comqtt/Dockerfile),
+# Postgres, PgBouncer, and RustFS (S3-compatible object store) so the
+# service can run end-to-end against real infrastructure on a laptop.
+#
+# Comqtt has no official image on Docker Hub; we pin v2.6.2 in the build
+# Dockerfile and let `docker compose build mqtt` produce comqtt:v2.6.2
+# locally. Bump the COMQTT_REF arg in deploy/comqtt/Dockerfile to adopt
+# a new upstream release.
+#
+# Usage:
+#   make compose-up        # start
+#   make compose-down      # stop and remove volumes
+#
+# The mqtt2db-go service itself is not run inside Compose — run it with
+# `make run` against config.dev.yaml so iteration stays fast. Adding the
+# service container is fine for CI integration tests via testcontainers-go.
+
+name: mqtt2db-go-dev
+
+services:
+  mqtt:
+    build:
+      context: ./comqtt
+    image: comqtt:v2.6.2
+    container_name: comqtt
+    restart: unless-stopped
+    command:
+      - "--tcp=:1883"
+      - "--ws=:1882"
+      - "--http=:8080"
+    ports:
+      - "1883:1883"   # MQTT
+      - "1882:1882"   # WebSocket
+      - "8080:8080"   # admin / dashboard
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ingest
+      POSTGRES_PASSWORD: ingest
+      POSTGRES_DB: telemetry
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ingest -d telemetry"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: pgbouncer
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ingest
+      DB_PASSWORD: ingest
+      DB_NAME: telemetry
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "50"
+      AUTH_TYPE: scram-sha-256
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_VOLUMES: /data
+      RUSTFS_REGION: us-east-1
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # admin console
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - rustfs-data:/data
+
+  rustfs-bucket-init:
+    # mc is a generic S3 CLI; we use it here against RustFS for one-shot
+    # bucket creation. RustFS itself does not depend on MinIO.
+    image: minio/mc:latest
+    container_name: rustfs-bucket-init
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin
+        mc mb --ignore-existing local/mqtt2db-go-dlq
+        echo "dead-letter bucket ready"
+    restart: "no"
+
+volumes:
+  postgres-data:
+  rustfs-data:

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +64,47 @@ func (f *fakeInserter) snapshot() [][]postgres.Message {
 		out[i] = append([]postgres.Message(nil), c...)
 	}
 	return out
+}
+
+// fakeWAL implements flusher.WALSource for the re-enqueue tests.
+type fakeWAL struct {
+	mu        sync.Mutex
+	drainErr  error
+	appendErr error
+	queue     []postgres.Message
+	requeued  []postgres.Message
+}
+
+func (w *fakeWAL) Drain(limit int) ([]postgres.Message, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.drainErr != nil {
+		return nil, w.drainErr
+	}
+	if len(w.queue) == 0 {
+		return nil, nil
+	}
+	if limit > len(w.queue) {
+		limit = len(w.queue)
+	}
+	out := append([]postgres.Message(nil), w.queue[:limit]...)
+	w.queue = w.queue[limit:]
+	return out, nil
+}
+func (w *fakeWAL) Append(m postgres.Message) ([]byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.appendErr != nil {
+		return nil, w.appendErr
+	}
+	w.requeued = append(w.requeued, m)
+	w.queue = append(w.queue, m)
+	return []byte(fmt.Sprintf("k%d", len(w.requeued))), nil
+}
+func (w *fakeWAL) snapshotRequeued() []postgres.Message {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]postgres.Message(nil), w.requeued...)
 }
 
 // fakeSource is a Dequeue-only queue that returns msgs in chunks.
@@ -280,4 +322,133 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return on cancel")
 	}
+}
+
+// TestRun_TransientFailureReenqueuesToWAL: when MaxRetries is exhausted
+// against a connection-level error AND the flusher has a WAL, the batch
+// is re-enqueued to the WAL instead of dead-lettered. This is the fix
+// captured in ADR 0005 for the sustained-slowdown stress test.
+func TestRun_TransientFailureReenqueuesToWAL(t *testing.T) {
+	src := &fakeSource{}
+	pg := &fakeInserter{
+		results: []fakeResult{
+			{err: errors.New("connection refused")},
+			{err: errors.New("connection refused")},
+			{err: errors.New("connection refused")},
+		},
+	}
+	wal := &fakeWAL{}
+	dl := &recordingDLQ{}
+
+	cfg := defaultFlusherCfg()
+	cfg.MaxRetries = 2
+
+	reg := metrics.NewRegistry()
+	m := metrics.NewFlusherMetrics(reg)
+	f, err := flusher.New(cfg, pg, src, wal, dl, m, nil)
+	require.NoError(t, err)
+
+	src.push(makeMsg(0), makeMsg(1), makeMsg(2))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = f.Run(ctx); close(done) }()
+
+	require.Eventually(t, func() bool {
+		return len(wal.snapshotRequeued()) == 3
+	}, 30*time.Second, 50*time.Millisecond, "all 3 messages should be re-enqueued to WAL")
+
+	cancel()
+	<-done
+
+	assert.Empty(t, dl.Snapshot(), "transient failure must not dead-letter when WAL is available")
+	assert.Equal(t, float64(3), testutil.ToFloat64(m.Requeued))
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.DeadLettered))
+}
+
+// TestRun_PoisonErrorAlwaysDeadLetters: a SQLSTATE 23xxx (constraint
+// violation) is deterministic poison — replaying it will fail the same
+// way. Even with a WAL available, this batch must dead-letter.
+func TestRun_PoisonErrorAlwaysDeadLetters(t *testing.T) {
+	src := &fakeSource{}
+	pgErr := &pgconn.PgError{Code: "23505", Message: "unique_violation"}
+	pg := &fakeInserter{
+		results: []fakeResult{
+			{err: pgErr},
+			{err: pgErr},
+			{err: pgErr},
+		},
+	}
+	wal := &fakeWAL{}
+	dl := &recordingDLQ{}
+
+	cfg := defaultFlusherCfg()
+	cfg.MaxRetries = 2
+
+	reg := metrics.NewRegistry()
+	m := metrics.NewFlusherMetrics(reg)
+	f, err := flusher.New(cfg, pg, src, wal, dl, m, nil)
+	require.NoError(t, err)
+
+	src.push(makeMsg(0), makeMsg(1))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = f.Run(ctx); close(done) }()
+
+	require.Eventually(t, func() bool {
+		return len(dl.Snapshot()) == 2
+	}, 30*time.Second, 50*time.Millisecond, "poison messages must DLQ even with a WAL")
+
+	cancel()
+	<-done
+
+	assert.Empty(t, wal.snapshotRequeued(), "poison must not be re-enqueued")
+	assert.Equal(t, float64(2), testutil.ToFloat64(m.DeadLettered))
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.Requeued))
+}
+
+// TestRun_TransientFailureWALFullFallsBackToDLQ: when the WAL itself is
+// failing (full / corrupt / disk-out), we fall back to the dead-letter
+// sink as the last-resort durability boundary. This must not silently
+// drop.
+func TestRun_TransientFailureWALFullFallsBackToDLQ(t *testing.T) {
+	src := &fakeSource{}
+	pg := &fakeInserter{
+		results: []fakeResult{
+			{err: errors.New("conn reset")},
+			{err: errors.New("conn reset")},
+			{err: errors.New("conn reset")},
+		},
+	}
+	wal := &fakeWAL{appendErr: errors.New("disk full")}
+	dl := &recordingDLQ{}
+
+	cfg := defaultFlusherCfg()
+	cfg.MaxRetries = 2
+
+	reg := metrics.NewRegistry()
+	m := metrics.NewFlusherMetrics(reg)
+	f, err := flusher.New(cfg, pg, src, wal, dl, m, nil)
+	require.NoError(t, err)
+
+	src.push(makeMsg(0), makeMsg(1))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = f.Run(ctx); close(done) }()
+
+	require.Eventually(t, func() bool {
+		return len(dl.Snapshot()) == 2
+	}, 30*time.Second, 50*time.Millisecond,
+		"with a failing WAL, transient failure must fall back to DLQ")
+
+	cancel()
+	<-done
+
+	assert.Empty(t, wal.snapshotRequeued())
+	assert.Equal(t, float64(2), testutil.ToFloat64(m.DeadLettered))
 }

@@ -1,8 +1,13 @@
 # Local AI assistant context — kept out of git
 CLAUDE.md
 
-# Internal design docs — kept out of the public repo
-docs/
+# Internal design docs — kept out of the public repo. ADRs ARE
+# committed (see docs/adr/) because they're the project's public
+# decision record.
+docs/ARCHITECTURE.md
+docs/CONFIGURATION.md
+docs/DEVELOPMENT_PLAN.md
+docs/RUNBOOK.md
 
 # macOS
 .DS_Store

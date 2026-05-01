@@ -7,6 +7,46 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.1.1] - TBD
+
+### Added
+
+- **Sustained-slowdown stress test** (Milestone 13). New harness under
+  `test/stress/slowdown/` drives the full pipeline through three
+  scenarios using toxiproxy as a fault injector between the flusher and
+  Postgres:
+  * **moderate** — +300 ms latency for 5 minutes
+  * **severe** — +2.5 s latency for 5 minutes
+  * **outage** — TCP rejected for 3 minutes
+  Each run produces a Markdown report under
+  `test/stress/slowdown/results/`. `make stress-slowdown` runs all
+  three at full duration; `make stress-slowdown-quick` shrinks the
+  windows for development feedback.
+
+- `mqtt2db_flusher_requeued_total` counter — records messages
+  re-enqueued to the WAL after a transient terminal flush failure (so
+  operators can distinguish real flusher errors from connection blips).
+
+- `mqtt2db_subscriber_paused` gauge and `mqtt2db_subscriber_pauses_total`
+  counter — track when the subscriber is dropping unacked messages
+  because the ring is full and the WAL refused them.
+
+### Changed
+
+- **Flusher transient-failure handling** (ADR 0005). When
+  `MaxRetries` is exhausted against a connection-level error, the batch
+  is now re-enqueued to the WAL via the new `WALSource.Append` method
+  rather than dead-lettered. Dead-letter is reserved for deterministic
+  poison (SQLSTATE 22xxx data exceptions, 23xxx integrity violations).
+  This fixes a bug where a sustained PG outage of more than ~31 seconds
+  would dead-letter every batch, in violation of the "do not silently
+  drop" contract from CLAUDE.md.
+
+- `flusher.WALSource` interface gained an `Append(msg) ([]byte, error)`
+  method. `wal.Store` already exposed it; the change is non-breaking
+  for production code but is a small breaking change for anyone who
+  implemented their own `WALSource` (none in tree).
+
 ## [0.1.0] - 2026-05-01
 
 Initial public release. Subscribes to a Comqtt MQTT 5 cluster via shared

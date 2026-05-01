@@ -4,12 +4,26 @@ High-throughput Go service that subscribes to MQTT topics on a Comqtt cluster an
 
 ## Status
 
-v0.1.0 — initial public release. See [CHANGELOG.md](CHANGELOG.md) for what
-shipped. 63 unit tests + 6 integration tests pass against real Comqtt
-v2.6.2 + Postgres 17 + RustFS via testcontainers. A self-contained stress
-test under `test/stress/` validated 600,000 messages over 30s @ 20K msg/s
-with zero internal loss; the buffer correctly spilled to WAL when the
-ring hit 80% and drained the WAL fully on recovery.
+v0.1.0 shipped. v0.1.1 in flight (sustained-slowdown stress test +
+flusher transient-failure handling). See [CHANGELOG.md](CHANGELOG.md)
+for the full list.
+
+66 unit tests + 6 integration tests pass against real Comqtt v2.6.2 +
+Postgres 17 + RustFS via testcontainers.
+
+**Steady-state stress** (`test/stress/`): 600,000 messages over 30s @
+20K msg/s with zero internal loss; the buffer correctly spilled to WAL
+when the ring hit 80% and drained the WAL fully on recovery.
+
+**Sustained-slowdown stress** (`test/stress/slowdown/`, three scenarios
+via toxiproxy):
+- moderate (+300 ms): flusher elevated → normal, zero DLQ, drain in seconds
+- severe (+2.5 s): flusher elevated → critical → recovery, WAL peaked
+  at ~130K messages, zero DLQ, drain in ~30s
+- outage (TCP rejected): flusher critical, subscriber paused, WAL
+  absorbed full traffic, zero DLQ, drain in seconds after recovery
+
+Each scenario writes a Markdown report to `test/stress/slowdown/results/`.
 
 ## Architecture at a Glance
 

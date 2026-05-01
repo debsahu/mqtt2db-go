@@ -25,8 +25,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/debsahu/mqtt2db-go/internal/buffer"
 	"github.com/debsahu/mqtt2db-go/internal/config"
@@ -41,10 +44,13 @@ type Source interface {
 	State() buffer.State
 }
 
-// WALSource is the optional WAL drain. If non-nil, the flusher pulls from
-// it after the ring is empty in a single tick.
+// WALSource is the optional WAL handle. The flusher pulls from it after
+// the ring is empty in a single tick, and re-enqueues batches into it
+// when a flush fails terminally for a transient reason (so the next
+// pullBatch retries from the WAL after critical mode lifts).
 type WALSource interface {
 	Drain(limit int) ([]postgres.Message, error)
+	Append(msg postgres.Message) ([]byte, error)
 }
 
 // DeadLetter is the sink for messages that exhausted retries.
@@ -192,6 +198,14 @@ func (f *Flusher) pullBatch() []postgres.Message {
 // hands every message to the dead-letter sink.
 func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) {
 	delay := time.Second
+	// Cap each individual flush attempt so a stuck PG conn doesn't wedge
+	// the mode-transition observer (which only fires on flush completion).
+	// 2x CriticalLatencyThreshold gives a normal flush enough headroom
+	// while still pushing the mode to critical promptly when PG is sick.
+	perAttemptTimeout := 2 * f.cfg.CriticalLatencyThreshold.AsDuration()
+	if perAttemptTimeout <= 0 {
+		perAttemptTimeout = 30 * time.Second
+	}
 	var lastErr error
 	for attempt := 0; attempt <= f.cfg.MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -205,7 +219,9 @@ func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) 
 		}
 
 		start := f.now()
-		inserted, err := f.pg.CopyMessages(ctx, batch)
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, perAttemptTimeout)
+		inserted, err := f.pg.CopyMessages(attemptCtx, batch)
+		cancelAttempt()
 		latency := f.now().Sub(start)
 		f.m.FlushLatency.Observe(latency.Seconds())
 
@@ -227,7 +243,37 @@ func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) 
 		f.enterCritical()
 	}
 
-	// Out of retries — hand the batch to the dead-letter sink.
+	// Out of retries. Distinguish transient (connection/latency) errors
+	// from poison (per-row constraint or data-exception) errors:
+	//
+	//   • transient + WAL available -> push the batch back into the WAL
+	//     and let the next critical-mode-recovery cycle pick it up. This
+	//     is the at-least-once contract: connection blips must NOT
+	//     terminate as DLQ. See docs/adr/0005-sustained-slowdown-stress-test.md.
+	//   • poison, or transient with no WAL -> dead-letter, because
+	//     replaying the same payload will hit the same error.
+	if !isPoisonError(lastErr) && f.wal != nil {
+		f.logger.Warn("retries exhausted; re-enqueuing batch to WAL",
+			"event", "requeue_to_wal",
+			"batch", len(batch),
+			"err", lastErr.Error())
+		var requeueErr error
+		for _, msg := range batch {
+			if _, err := f.wal.Append(msg); err != nil {
+				requeueErr = err
+				break
+			}
+			f.m.Requeued.Inc()
+		}
+		if requeueErr == nil {
+			return
+		}
+		// WAL itself is failing — fall through to dead-letter as last resort.
+		f.logger.Error("WAL re-enqueue failed; dead-lettering instead",
+			"event", "wal_requeue_failed",
+			"err", requeueErr.Error())
+	}
+
 	f.logger.Error("retries exhausted; dead-lettering batch",
 		"event", "dead_letter",
 		"batch", len(batch),
@@ -242,6 +288,31 @@ func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) 
 		}
 		f.m.DeadLettered.Inc()
 	}
+}
+
+// isPoisonError reports whether err is a deterministic per-row failure
+// that will not succeed on replay regardless of how long we wait.
+// PostgreSQL SQLSTATE classes:
+//
+//	22xxx  Data Exception           (e.g. invalid encoding)
+//	23xxx  Integrity Constraint     (e.g. dedup_key collision is not
+//	                                 here — it's collapsed by ON CONFLICT
+//	                                 before we ever see it; CHECK / FK
+//	                                 violations would be)
+//
+// Everything else (connect refused, timeout, network unreachable, server
+// shutdown) is transient and worth retrying via the WAL.
+func isPoisonError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "23") {
+			return true
+		}
+	}
+	return false
 }
 
 // --- mode + latency tracking ------------------------------------------------

@@ -72,6 +72,24 @@ stress-slowdown-quick: ## Same scenarios, abbreviated timings — for developmen
 	SLOWDOWN_WARMUP=20s SLOWDOWN_TOXIC=60s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
 	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_Outage$$'   ./test/stress/slowdown/
 
+.PHONY: stress-oscillation
+stress-oscillation: ## Oscillation stress (Milestone 14a). Repeated slow/fast cycles via toxiproxy.
+	# Each scenario runs in its own go-test invocation so toxiproxy
+	# state from a previous run doesn't leak into the next.
+	go test -tags=slowdown -count=1 -timeout=90m -v  -run='^TestSlowdown_OscillationFast$$' ./test/stress/slowdown/
+	go test -tags=slowdown -count=1 -timeout=120m -v -run='^TestSlowdown_OscillationSlow$$' ./test/stress/slowdown/
+
+.PHONY: stress-oscillation-quick
+stress-oscillation-quick: ## Same scenarios, abbreviated timings — for development feedback.
+	# 3 cycles of 15s slow / 15s clean at 2K msg/s. Fast feedback,
+	# enough cycles to exercise the ratchet + mode-stability checks.
+	SLOWDOWN_WARMUP=20s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    SLOWDOWN_OSC_SLOW=15s SLOWDOWN_OSC_CLEAN=15s SLOWDOWN_OSC_CYCLES=3 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationFast$$' ./test/stress/slowdown/
+	SLOWDOWN_WARMUP=20s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    SLOWDOWN_OSC_SLOW=45s SLOWDOWN_OSC_CLEAN=45s SLOWDOWN_OSC_CYCLES=3 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationSlow$$' ./test/stress/slowdown/
+
 .PHONY: cover
 cover: ## Generate coverage report at coverage.out / coverage.html
 	go test -race -coverprofile=coverage.out ./internal/...

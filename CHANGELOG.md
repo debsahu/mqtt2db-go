@@ -7,6 +7,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Oscillation stress test** (Milestone 14a). New scenarios in
+  `test/stress/slowdown/oscillation_test.go` drive the pipeline
+  through repeated slow→clean cycles via toxiproxy:
+  * `TestSlowdown_OscillationFast` — 6 cycles of 30 s slow / 30 s
+    clean (both windows shorter than `RecoveryWindow=60s`). Verifies
+    the flusher parks in elevated/critical and does not ping-pong.
+  * `TestSlowdown_OscillationSlow` — 6 cycles of 90 s slow / 90 s
+    clean (both windows longer than `RecoveryWindow`). Verifies the
+    flusher fully recovers each cycle and the per-conn cached staging
+    survives PG hiccups.
+  Per-scenario report writes a per-cycle table to
+  `test/stress/slowdown/results/`.
+  `make stress-oscillation` runs both at full duration;
+  `make stress-oscillation-quick` shrinks the windows for development
+  feedback.
+
+- **Ratchet detector**: assertion that WAL depth at the END of each
+  clean window does not grow monotonically across cycles. Catches the
+  failure mode where each clean window leaves more in the WAL than
+  the previous, which would surface as ever-growing drain times in
+  steady-state. Unit-tested in `oscillation_unit_test.go` against
+  healthy / transient-spike / true-ratchet / plateau patterns.
+
+- **Mode-flap detector**: assertion that the flusher transitions
+  between modes no more than `2 × cycles + 4` times in a run. Catches
+  hysteresis bugs where a tight RecoveryWindow makes the flusher
+  oscillate between normal and elevated faster than the duty cycle.
+
+### Operational notes
+
+- Both oscillation scenarios are gated by the existing `slowdown`
+  build tag — they don't run by default. Same isolation as the M13
+  scenarios. Toxiproxy + Postgres + Comqtt + RustFS testcontainers
+  are required; the existing `make` targets handle them.
+
 ## [0.1.2] - 2026-05-02
 
 ### Added

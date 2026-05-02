@@ -533,6 +533,48 @@ func (h *Harness) observePeak(prev int64) int64 {
 	return prev
 }
 
+// walOutstanding returns the current WAL depth (appended − drained).
+// Cheap; used by oscillation scenarios to sample at slow-window
+// boundaries without going through the full snapshot path.
+func (h *Harness) walOutstanding() int64 {
+	wal := int64(testutil.ToFloat64(h.WalM.Appended) - testutil.ToFloat64(h.WalM.Drained))
+	if wal < 0 {
+		wal = 0
+	}
+	return wal
+}
+
+// currentMode returns the flusher's current mode as a string.
+func (h *Harness) currentMode() string {
+	switch int(testutil.ToFloat64(h.FlushM.Mode)) {
+	case 1:
+		return "elevated"
+	case 2:
+		return "critical"
+	default:
+		return "normal"
+	}
+}
+
+// walPeakBetween scans the timeline for the highest WAL outstanding
+// observed within [start, end]. Used by oscillation scenarios to
+// detect ratcheting across cycles. Caller must take h.tlMu if it
+// needs a stable snapshot; here we read under the lock briefly.
+func (h *Harness) walPeakBetween(start, end time.Time) int64 {
+	h.tlMu.Lock()
+	defer h.tlMu.Unlock()
+	var peak float64
+	for _, e := range h.timeline {
+		if e.At.Before(start) || e.At.After(end) {
+			continue
+		}
+		if e.WAL > peak {
+			peak = e.WAL
+		}
+	}
+	return int64(peak)
+}
+
 type scenarioReport struct {
 	Scenario         string
 	StartedAt        time.Time
@@ -551,6 +593,28 @@ type scenarioReport struct {
 	Snapshots        []reportSnapshot
 	Pass             []string
 	Fail             []string
+
+	// Cycles is populated only by oscillation scenarios. nil for the
+	// existing one-shot moderate / severe / outage runs.
+	Cycles []cycleStats
+}
+
+// cycleStats captures one slow→clean cycle of an oscillation scenario.
+// Used to detect WAL ratcheting (peak monotonically growing) and mode
+// thrashing across cycles.
+type cycleStats struct {
+	Cycle              int
+	SlowStartAt        time.Time
+	SlowEndAt          time.Time
+	CleanEndAt         time.Time
+	StartMode          string // mode at the moment toxic was applied
+	SlowEndMode        string // mode at the moment toxic was removed
+	CleanEndMode       string // mode at the end of the clean window
+	WALAtSlowStart     int64
+	WALPeakInCycle     int64 // observed peak between SlowStartAt and CleanEndAt
+	WALAtCleanEnd      int64
+	InsertedInCycle    int64 // delta of flusher.inserted_total over the cycle
+	BatchSizeAtSlowEnd float64
 }
 
 type reportSnapshot struct {
@@ -622,6 +686,18 @@ func writeReport(t *testing.T, r scenarioReport) {
 	for _, f := range r.Fail {
 		fmt.Fprintf(&b, "- ❌ %s\n", f)
 	}
+	if len(r.Cycles) > 0 {
+		fmt.Fprintf(&b, "\n## Per-cycle Stats (oscillation)\n\n")
+		fmt.Fprintf(&b, "| cycle | slow_start_mode | slow_end_mode | clean_end_mode | wal_start | wal_peak | wal_clean_end | inserted | batch@slow_end |\n")
+		fmt.Fprintf(&b, "|------:|:----------------|:--------------|:---------------|---------:|--------:|-------------:|--------:|--------------:|\n")
+		for _, c := range r.Cycles {
+			fmt.Fprintf(&b, "| %5d | %s | %s | %s | %d | %d | %d | %d | %.0f |\n",
+				c.Cycle, c.StartMode, c.SlowEndMode, c.CleanEndMode,
+				c.WALAtSlowStart, c.WALPeakInCycle, c.WALAtCleanEnd,
+				c.InsertedInCycle, c.BatchSizeAtSlowEnd)
+		}
+	}
+
 	fmt.Fprintf(&b, "\n## Mode Transitions\n\n")
 	fmt.Fprintf(&b, "Sampled every second. Rows emitted on mode change OR on a `note` (toxic add/remove, end of phase).\n\n")
 	fmt.Fprintf(&b, "| t (s) | mode | batch | ring | wal | paused | note |\n")

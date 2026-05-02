@@ -4,9 +4,10 @@ High-throughput Go service that subscribes to MQTT topics on a Comqtt cluster an
 
 ## Status
 
-v0.1.0 shipped. v0.1.1 in flight (sustained-slowdown stress test +
-flusher transient-failure handling). See [CHANGELOG.md](CHANGELOG.md)
-for the full list.
+v0.1.0 shipped. v0.1.1 in review — sustained-slowdown stress test,
+flusher transient-failure handling, per-connection cached staging,
+and parallel flusher workers. See [CHANGELOG.md](CHANGELOG.md) for
+the full list.
 
 66 unit tests + 6 integration tests pass against real Comqtt v2.6.2 +
 Postgres 17 + RustFS via testcontainers.

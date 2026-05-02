@@ -11,6 +11,17 @@ on:
   push:
     branches: [main]
     tags: ["v*.*.*"]
+    # Skip docs-only commits to main. Tag pushes always run regardless
+    # — paths-ignore applies to the matched event, and a tag push has
+    # no `paths` to filter on, so a `vX.Y.Z` tag still publishes the
+    # release even if the tagged commit only changed docs.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - ".githooks/**"
+      - ".gitignore"
 
 permissions:
   contents: read

@@ -112,6 +112,20 @@ type Harness struct {
 	timeline []TimelineEvent
 	tlMu     sync.Mutex
 
+	// fastPeakWAL is the highest WAL outstanding seen by the 100 ms
+	// fast poller since startTimelineRecorder began. Oscillation
+	// scenarios reset this at each cycle boundary so cs.WALPeakInCycle
+	// captures sub-second spikes the 1 Hz timeline misses. Read /
+	// reset only via SnapshotAndResetPeakWAL; do NOT compare-and-swap
+	// from the cycle loop while the poller is running.
+	fastPeakWAL atomic.Int64
+
+	// fastModeTransitions counts mode changes observed by the same
+	// 100 ms poller. The 1 Hz timeline aliases sub-second flips down
+	// to a single sample, so the M14a mode-flap detector reads this
+	// counter, not the 1 Hz transition count.
+	fastModeTransitions atomic.Int64
+
 	// peakMode tracks the highest mode value observed at any sampling
 	// instant by startTimelineRecorder. We poll faster (every 100ms)
 	// just for this so brief mode oscillations don't escape the test.
@@ -154,6 +168,12 @@ func setupHarness(t *testing.T, ctx context.Context, scenarioName string) *Harne
 
 	publishers := envInt("STRESS_PUBLISHERS", 16)
 	devices := envInt("STRESS_DEVICES", 1000)
+
+	// Validate operator-facing knobs once, at startup. Both helpers
+	// fail the test fatally on invalid input so a typo in a make
+	// recipe (or env export) never silently runs the wrong benchmark.
+	_ = activeSchemaTB(t)
+	_ = payloadSizeTB(t)
 
 	t.Logf("[%s] booting infrastructure...", scenarioName)
 	dockerNet, err := network.New(ctx)
@@ -415,10 +435,15 @@ func (h *Harness) startTimelineRecorder(ctx context.Context) {
 			}
 		}
 	}()
-	// Fast peak-mode poller: 100ms cadence, only writes the atomic.
+	// Fast 100 ms poller: peak mode (gauge), peak WAL (gauge), and
+	// fine-grained mode-transition count. The 1 Hz timeline aliases
+	// sub-second mode flips to a single sample; this poller catches
+	// them. Only writes atomics so it stays lock-free against the
+	// hot path.
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
+		var lastMode int32 = -1
 		for {
 			select {
 			case <-ctx.Done():
@@ -431,9 +456,38 @@ func (h *Harness) startTimelineRecorder(ctx context.Context) {
 						break
 					}
 				}
+				if lastMode != -1 && m != lastMode {
+					h.fastModeTransitions.Add(1)
+				}
+				lastMode = m
+
+				wal := int64(testutil.ToFloat64(h.WalM.Appended) - testutil.ToFloat64(h.WalM.Drained))
+				if wal < 0 {
+					wal = 0
+				}
+				for {
+					prev := h.fastPeakWAL.Load()
+					if wal <= prev || h.fastPeakWAL.CompareAndSwap(prev, wal) {
+						break
+					}
+				}
 			}
 		}
 	}()
+}
+
+// SnapshotAndResetPeakWAL atomically reads the highest WAL outstanding
+// observed since the last reset, then resets the tracker to the
+// current WAL depth. Oscillation scenarios call this at each cycle
+// boundary so cs.WALPeakInCycle is a true sub-second peak, not a
+// 1 Hz alias.
+func (h *Harness) SnapshotAndResetPeakWAL() int64 {
+	cur := h.walOutstanding()
+	prev := h.fastPeakWAL.Swap(cur)
+	if prev > cur {
+		return prev
+	}
+	return cur
 }
 
 func (h *Harness) appendTimeline(e TimelineEvent) {

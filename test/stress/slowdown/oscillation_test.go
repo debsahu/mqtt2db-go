@@ -54,6 +54,19 @@ type oscillationOpts struct {
 	slowWindow  time.Duration // duration of the slow phase per cycle
 	cleanWindow time.Duration // duration of the clean phase per cycle
 	cycles      int           // number of slow→clean cycles
+
+	// expectMaxSlowEndMode asserts that across all cycles the
+	// `slow_end` mode reached at least this level. "" disables.
+	// Catches the regression where the toxic was applied but the
+	// flusher never noticed.
+	expectMaxSlowEndMode string // "elevated" | "critical"
+
+	// expectCleanRecoveryByCycle asserts that at least one cycle ≥
+	// this index ended its clean window with mode=normal. 0 disables.
+	// Only meaningful when cleanWindow > FlusherConfig.RecoveryWindow
+	// (otherwise the flusher doesn't have time to recover and the
+	// assertion is structurally impossible).
+	expectCleanRecoveryByCycle int
 }
 
 // runOscillationScenario drives load through Cycles slow/clean cycles,
@@ -114,7 +127,10 @@ func runOscillationScenario(t *testing.T, h *Harness, opt oscillationOpts) {
 		}
 
 		// Capture starting state BEFORE applying the toxic so deltas
-		// are accurate.
+		// are accurate. SnapshotAndResetPeakWAL also clears the fast
+		// poller's peak tracker so cs.WALPeakInCycle captures a TRUE
+		// sub-second peak, not an alias of the 1 Hz timeline.
+		_ = h.SnapshotAndResetPeakWAL()
 		insertedAtCycleStart := int64(testutil.ToFloat64(h.FlushM.Inserted))
 		cs := cycleStats{
 			Cycle:          i,
@@ -129,9 +145,8 @@ func runOscillationScenario(t *testing.T, h *Harness, opt oscillationOpts) {
 		t.Logf("[%s] cycle %d/%d: toxic ON for %s",
 			opt.name, i, opt.cycles, opt.slowWindow)
 
-		// Slow window. The 1Hz timeline recorder is already capturing
-		// per-second WAL/mode samples on its own goroutine; we just
-		// sleep here.
+		// Slow window. The 100 ms fast poller is tracking peak WAL
+		// and mode transitions; we just sleep.
 		sleepAndSample(ctx, opt.slowWindow)
 		cs.SlowEndAt = time.Now()
 		cs.SlowEndMode = h.currentMode()
@@ -148,7 +163,9 @@ func runOscillationScenario(t *testing.T, h *Harness, opt oscillationOpts) {
 		cs.CleanEndAt = time.Now()
 		cs.CleanEndMode = h.currentMode()
 		cs.WALAtCleanEnd = h.walOutstanding()
-		cs.WALPeakInCycle = h.walPeakBetween(cs.SlowStartAt, cs.CleanEndAt)
+		// True sub-second peak from the 100 ms poller. SnapshotAndReset
+		// also rearms it for the next cycle.
+		cs.WALPeakInCycle = h.SnapshotAndResetPeakWAL()
 		cs.InsertedInCycle = int64(testutil.ToFloat64(h.FlushM.Inserted)) - insertedAtCycleStart
 
 		report.Cycles = append(report.Cycles, cs)
@@ -230,25 +247,72 @@ func runOscillationScenario(t *testing.T, h *Harness, opt oscillationOpts) {
 		report.Pass = append(report.Pass, "no WAL ratcheting across cycles (peak stable / decreasing)")
 	}
 
-	// Mode-stability: count the number of distinct mode transitions
-	// across the whole run. We don't have a per-event log of mode
-	// changes, so we approximate by counting transitions in the
-	// 1-second timeline. With Cycles slow/clean cycles, a healthy
-	// run should see ≤ 2 × cycles transitions (one in, one out per
-	// cycle) plus a small constant for warmup. Anything wildly higher
-	// is flap.
-	transitions := countModeTransitions(h)
-	maxExpected := 2*opt.cycles + 4
+	// Mode-stability uses the 100 ms fast counter, not the 1 Hz
+	// timeline. The flusher changes mode on flush boundaries
+	// (100 ms normal / 500 ms elevated), so 1 Hz sampling can alias
+	// multiple flips down to zero observed transitions and let real
+	// flap pass.
+	//
+	// Threshold derivation: each cycle naturally walks
+	//   normal → critical (1)
+	//   ↔ elevated near the threshold while toxic is on (0–2)
+	//   → elevated (1) → normal (1) during recovery
+	// That's 3–4 transitions per cycle in healthy operation under a
+	// 2.5 s toxic. Bound at 4 × cycles + 4 leaves headroom for one
+	// extra threshold-crossing per cycle and is still well below
+	// pathological flap (which would scale with elapsed time, not
+	// cycle count).
+	transitions := int(h.fastModeTransitions.Load())
+	maxExpected := 4*opt.cycles + 4
 	if transitions <= maxExpected {
 		report.Pass = append(report.Pass, fmt.Sprintf(
-			"mode transitions %d ≤ %d (no flapping)", transitions, maxExpected))
+			"mode transitions %d ≤ %d (no flapping; 100 ms sampled)", transitions, maxExpected))
 	} else {
 		report.Fail = append(report.Fail, fmt.Sprintf(
 			"mode flapping: %d transitions, expected ≤ %d", transitions, maxExpected))
 	}
 
+	// Per-scenario mode-state assertions (separate from the
+	// transition cap; the cap alone passes when mode is stuck at
+	// one extreme — Copilot caught this). opt.expectMaxSlowEndMode
+	// and opt.expectCleanRecoveryByCycle let the fast and slow
+	// scenarios state different expectations.
+	if opt.expectMaxSlowEndMode != "" {
+		got := highestModeAcrossCycles(report.Cycles, sceneSlowEnd)
+		if modeRank(got) >= modeRank(opt.expectMaxSlowEndMode) {
+			report.Pass = append(report.Pass, fmt.Sprintf(
+				"slow_end mode reached %s (≥ %s expected)", got, opt.expectMaxSlowEndMode))
+		} else {
+			report.Fail = append(report.Fail, fmt.Sprintf(
+				"slow_end mode never reached %s (highest=%s)", opt.expectMaxSlowEndMode, got))
+		}
+	}
+	if opt.expectCleanRecoveryByCycle > 0 {
+		recovered := false
+		for _, c := range report.Cycles {
+			if c.Cycle >= opt.expectCleanRecoveryByCycle && c.CleanEndMode == "normal" {
+				recovered = true
+				break
+			}
+		}
+		if recovered {
+			report.Pass = append(report.Pass, fmt.Sprintf(
+				"clean_end mode recovered to normal by cycle %d", opt.expectCleanRecoveryByCycle))
+		} else {
+			report.Fail = append(report.Fail, fmt.Sprintf(
+				"no cycle ≥ %d ended with clean_end mode=normal — recovery never completed",
+				opt.expectCleanRecoveryByCycle))
+		}
+	}
+
 	report.EndedAt = time.Now()
+	// Hold tlMu for the copy. The 1 Hz recorder is still running
+	// until tlCancel below, but its only mutator is appendTimeline
+	// which takes the same mutex — so this lock serializes with
+	// any in-flight append.
+	h.tlMu.Lock()
 	report.ModeTimeline = append([]TimelineEvent(nil), h.timeline...)
+	h.tlMu.Unlock()
 	tlCancel()
 	writeReport(t, report)
 
@@ -339,23 +403,47 @@ func detectRatchet(cs []cycleStats) (bool, string) {
 	return false, ""
 }
 
-// countModeTransitions counts the number of times the recorded mode
-// changes from one timeline sample to the next.
-func countModeTransitions(h *Harness) int {
-	h.tlMu.Lock()
-	defer h.tlMu.Unlock()
-	var transitions int
-	prev := ""
-	for _, e := range h.timeline {
-		if e.Mode == "" {
-			continue
-		}
-		if prev != "" && e.Mode != prev {
-			transitions++
-		}
-		prev = e.Mode
+// modeRank lets the per-scenario assertion compare modes with
+// ≥ semantics. Order matches FlusherMetrics.Mode (0/1/2).
+func modeRank(m string) int {
+	switch m {
+	case "critical":
+		return 2
+	case "elevated":
+		return 1
+	case "normal":
+		return 0
 	}
-	return transitions
+	return -1
+}
+
+// cycleField selects which mode column to inspect — used by
+// highestModeAcrossCycles below.
+type cycleField int
+
+const (
+	sceneSlowEnd cycleField = iota
+	sceneCleanEnd
+)
+
+// highestModeAcrossCycles returns the highest-ranking mode observed
+// across `cs` at the chosen field. "normal" if no cycles or all are
+// blank.
+func highestModeAcrossCycles(cs []cycleStats, f cycleField) string {
+	highest := "normal"
+	for _, c := range cs {
+		var m string
+		switch f {
+		case sceneSlowEnd:
+			m = c.SlowEndMode
+		case sceneCleanEnd:
+			m = c.CleanEndMode
+		}
+		if modeRank(m) > modeRank(highest) {
+			highest = m
+		}
+	}
+	return highest
 }
 
 // --- Scenario: oscillation FAST (cycles SHORTER than RecoveryWindow) ---
@@ -388,6 +476,13 @@ func TestSlowdown_OscillationFast(t *testing.T) {
 		slowWindow:  envDuration("SLOWDOWN_OSC_SLOW", 30*time.Second),
 		cleanWindow: envDuration("SLOWDOWN_OSC_CLEAN", 30*time.Second),
 		cycles:      envInt("SLOWDOWN_OSC_CYCLES", 6),
+		// 2.5 s latency definitely escalates the flusher; if we
+		// never even reach elevated the toxic was a no-op.
+		expectMaxSlowEndMode: "elevated",
+		// Both windows shorter than RecoveryWindow=60s, so we do
+		// NOT expect recovery between cycles. expectCleanRecovery
+		// stays unset.
+		expectCleanRecoveryByCycle: 0,
 	})
 }
 
@@ -423,6 +518,14 @@ func TestSlowdown_OscillationSlow(t *testing.T) {
 		slowWindow:  envDuration("SLOWDOWN_OSC_SLOW", 90*time.Second),
 		cleanWindow: envDuration("SLOWDOWN_OSC_CLEAN", 90*time.Second),
 		cycles:      envInt("SLOWDOWN_OSC_CYCLES", 6),
+		// 2.5 s latency must drive the flusher to elevated (or
+		// critical) during the slow window.
+		expectMaxSlowEndMode: "elevated",
+		// 90 s clean window > 60 s RecoveryWindow → at least one
+		// cycle from cycle 2 onwards must end with mode=normal.
+		// Without this assertion the test would pass even when
+		// recovery never happens (Copilot caught this).
+		expectCleanRecoveryByCycle: 2,
 	})
 }
 

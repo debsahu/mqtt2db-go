@@ -86,8 +86,13 @@ stress-oscillation-quick: ## Same scenarios, abbreviated timings — for develop
 	SLOWDOWN_WARMUP=20s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
 	    SLOWDOWN_OSC_SLOW=15s SLOWDOWN_OSC_CLEAN=15s SLOWDOWN_OSC_CYCLES=3 \
 	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationFast$$' ./test/stress/slowdown/
+	# Slow-cycle quick params: 75s clean is JUST above the
+	# RecoveryWindow=60s default, so the recovery assertion in
+	# TestSlowdown_OscillationSlow is structurally testable. Don't
+	# shrink below RecoveryWindow or the assertion becomes
+	# impossible-by-design.
 	SLOWDOWN_WARMUP=20s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
-	    SLOWDOWN_OSC_SLOW=45s SLOWDOWN_OSC_CLEAN=45s SLOWDOWN_OSC_CYCLES=3 \
+	    SLOWDOWN_OSC_SLOW=75s SLOWDOWN_OSC_CLEAN=75s SLOWDOWN_OSC_CYCLES=3 \
 	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationSlow$$' ./test/stress/slowdown/
 
 .PHONY: stress-realistic
@@ -121,9 +126,12 @@ stress-realistic-quick: ## Same wide-schema sweep, abbreviated timings — for d
 	    SLOWDOWN_WARMUP=20s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
 	    SLOWDOWN_OSC_SLOW=15s SLOWDOWN_OSC_CLEAN=15s SLOWDOWN_OSC_CYCLES=3 \
 	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationFast$$' ./test/stress/slowdown/
+	# 75s clean window > RecoveryWindow=60s so the recovery
+	# assertion in TestSlowdown_OscillationSlow is structurally
+	# testable. See stress-oscillation-quick for the same constraint.
 	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
 	    SLOWDOWN_WARMUP=20s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
-	    SLOWDOWN_OSC_SLOW=45s SLOWDOWN_OSC_CLEAN=45s SLOWDOWN_OSC_CYCLES=3 \
+	    SLOWDOWN_OSC_SLOW=75s SLOWDOWN_OSC_CLEAN=75s SLOWDOWN_OSC_CYCLES=3 \
 	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationSlow$$' ./test/stress/slowdown/
 
 .PHONY: cover

@@ -225,7 +225,12 @@ func runScenario(t *testing.T, h *Harness, opt scenarioOpts) {
 	}
 
 	report.EndedAt = time.Now()
+	// tlMu protects timeline against in-flight appends from the
+	// 1 Hz recorder. tlCancel below will eventually stop it; the
+	// lock makes the copy safe to take while it is still running.
+	h.tlMu.Lock()
 	report.ModeTimeline = append([]TimelineEvent(nil), h.timeline...)
+	h.tlMu.Unlock()
 	tlCancel()
 	writeReport(t, report)
 

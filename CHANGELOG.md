@@ -13,12 +13,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `test/stress/slowdown/oscillation_test.go` drive the pipeline
   through repeated slow→clean cycles via toxiproxy:
   * `TestSlowdown_OscillationFast` — 6 cycles of 30 s slow / 30 s
-    clean (both windows shorter than `RecoveryWindow=60s`). Verifies
-    the flusher parks in elevated/critical and does not ping-pong.
+    clean (both windows shorter than `RecoveryWindow=60s`). Asserts
+    the flusher reaches at least elevated mode during each slow
+    window and that mode-transition count stays bounded (no
+    ping-pong). Does NOT assert recovery — the windows are too short
+    for that by construction.
   * `TestSlowdown_OscillationSlow` — 6 cycles of 90 s slow / 90 s
-    clean (both windows longer than `RecoveryWindow`). Verifies the
-    flusher fully recovers each cycle and the per-conn cached staging
-    survives PG hiccups.
+    clean (both windows longer than `RecoveryWindow`). Same
+    "reaches elevated" assertion plus an explicit recovery check:
+    at least one cycle from cycle 2 onwards must end its clean
+    window with mode=normal. Without this, the test would pass even
+    if recovery never completed.
   Per-scenario report writes a per-cycle table to
   `test/stress/slowdown/results/`.
   `make stress-oscillation` runs both at full duration;
@@ -33,9 +38,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   healthy / transient-spike / true-ratchet / plateau patterns.
 
 - **Mode-flap detector**: assertion that the flusher transitions
-  between modes no more than `2 × cycles + 4` times in a run. Catches
+  between modes no more than `4 × cycles + 4` times in a run, sampled
+  at 100 ms (the 1 Hz timeline aliases sub-second flips). Catches
   hysteresis bugs where a tight RecoveryWindow makes the flusher
-  oscillate between normal and elevated faster than the duty cycle.
+  oscillate faster than the duty cycle. Allows up to four transitions
+  per cycle to cover the natural normal → critical → elevated →
+  normal walk under sustained toxic latency.
 
 - **Realistic-schema stress sweep** (Milestone 14b, ADR 0007). The
   v0.1.1 / v0.1.2 stress numbers were measured against the minimal

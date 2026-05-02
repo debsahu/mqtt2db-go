@@ -54,6 +54,24 @@ test-k8s: ## kind + helm rollout test (requires kind, helm, kubectl)
 stress: ## Run a stress scenario: make stress SCENARIO=steady|burst|soak|pause
 	@./test/stress/scenarios.sh $(SCENARIO)
 
+.PHONY: stress-slowdown
+stress-slowdown: ## Sustained-slowdown stress (Milestone 13). Three scenarios via toxiproxy.
+	# Each scenario runs in its own go-test invocation so toxiproxy
+	# doesn't observe leftover docker port reservations from the previous
+	# test in the same process.
+	go test -tags=slowdown -count=1 -timeout=45m -v -run='^TestSlowdown_Moderate$$' ./test/stress/slowdown/
+	go test -tags=slowdown -count=1 -timeout=45m -v -run='^TestSlowdown_Severe$$'   ./test/stress/slowdown/
+	go test -tags=slowdown -count=1 -timeout=45m -v -run='^TestSlowdown_Outage$$'   ./test/stress/slowdown/
+
+.PHONY: stress-slowdown-quick
+stress-slowdown-quick: ## Same scenarios, abbreviated timings — for development feedback.
+	SLOWDOWN_WARMUP=20s SLOWDOWN_TOXIC=60s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_Moderate$$' ./test/stress/slowdown/
+	SLOWDOWN_WARMUP=20s SLOWDOWN_TOXIC=60s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_Severe$$'   ./test/stress/slowdown/
+	SLOWDOWN_WARMUP=20s SLOWDOWN_TOXIC=60s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_Outage$$'   ./test/stress/slowdown/
+
 .PHONY: cover
 cover: ## Generate coverage report at coverage.out / coverage.html
 	go test -race -coverprofile=coverage.out ./internal/...
@@ -62,6 +80,11 @@ cover: ## Generate coverage report at coverage.out / coverage.html
 .PHONY: lint
 lint: ## Run golangci-lint
 	golangci-lint run ./...
+
+.PHONY: hooks
+hooks: ## Enable repo git hooks (pre-push lint+vet+test)
+	git config core.hooksPath .githooks
+	@echo "git hooks enabled at .githooks/ — bypass with 'git push --no-verify' or SKIP_PRE_PUSH=1"
 
 .PHONY: fmt
 fmt: ## Format Go sources with gofmt and goimports

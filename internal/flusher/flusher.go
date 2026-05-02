@@ -25,8 +25,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/debsahu/mqtt2db-go/internal/buffer"
 	"github.com/debsahu/mqtt2db-go/internal/config"
@@ -41,10 +44,13 @@ type Source interface {
 	State() buffer.State
 }
 
-// WALSource is the optional WAL drain. If non-nil, the flusher pulls from
-// it after the ring is empty in a single tick.
+// WALSource is the optional WAL handle. The flusher pulls from it after
+// the ring is empty in a single tick, and re-enqueues batches into it
+// when a flush fails terminally for a transient reason (so the next
+// pullBatch retries from the WAL after critical mode lifts).
 type WALSource interface {
 	Drain(limit int) ([]postgres.Message, error)
+	Append(msg postgres.Message) ([]byte, error)
 }
 
 // DeadLetter is the sink for messages that exhausted retries.
@@ -92,6 +98,13 @@ type Flusher struct {
 	latencyWindow  []time.Duration // recent flush latencies for p95
 	windowCapacity int             // size of the rolling window
 
+	// walMu serializes WAL.Drain calls across workers so two workers
+	// don't read the same key range and double-flush. CopyMessages
+	// itself is parallelism-safe (each call acquires its own pool conn,
+	// and PG's unique index on dedup_key collapses any incidental
+	// duplicates).
+	walMu sync.Mutex
+
 	// allow injecting a clock for tests
 	now func() time.Time
 }
@@ -135,24 +148,50 @@ func New(
 	}, nil
 }
 
-// Run blocks until ctx is canceled. Each tick pulls up to BatchSize from
-// the source (and the WAL if non-nil), flushes once, and updates mode
-// based on observed latency.
+// Run blocks until ctx is canceled. Spawns cfg.Workers parallel flush
+// goroutines (default 1). Each worker independently pulls a batch from
+// the ring or WAL and runs CopyMessages against its own pgxpool
+// connection. Mode transitions and the critical-mode gate stay
+// serialized through f.mu, so workers cooperate on global state but
+// parallelize the I/O path.
 func (f *Flusher) Run(ctx context.Context) error {
+	workers := f.cfg.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+
 	f.m.Mode.Set(float64(ModeNormal))
 	f.m.BatchSize.Set(float64(f.cfg.BatchSize))
 	f.logger.Info("started", "event", "started",
 		"batch_size", f.cfg.BatchSize,
-		"flush_interval", f.cfg.FlushInterval.AsDuration())
+		"flush_interval", f.cfg.FlushInterval.AsDuration(),
+		"workers", workers)
 
-	timer := time.NewTimer(f.cfg.FlushInterval.AsDuration())
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.workerLoop(ctx)
+		}()
+	}
+	wg.Wait()
+	f.logger.Info("stopped", "event", "stopped")
+	return nil
+}
+
+// workerLoop is the per-goroutine flush loop. Concurrent calls to
+// pullBatch are safe (the ring and WAL are individually thread-safe;
+// pullBatch serializes WAL.Drain via f.walMu so two workers don't
+// duplicate-read the same key range). flushWithRetry uses its own
+// pgxpool acquisition so workers don't queue on a single connection.
+func (f *Flusher) workerLoop(ctx context.Context) {
+	timer := time.NewTimer(f.flushIntervalForMode())
 	defer timer.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			f.logger.Info("stopped", "event", "stopped")
-			return nil
+			return
 		case <-timer.C:
 		}
 
@@ -173,12 +212,15 @@ func (f *Flusher) Run(ctx context.Context) error {
 }
 
 // pullBatch reads from the ring first and tops up from the WAL if there's
-// headroom. Bounded by the active batch size.
+// headroom. Bounded by the active batch size. WAL drains are serialized
+// across workers so two parallel flushers don't read the same WAL keys.
 func (f *Flusher) pullBatch() []postgres.Message {
 	batchSize := f.batchSizeForMode()
 	out := f.src.Dequeue(batchSize)
 	if f.wal != nil && len(out) < batchSize {
+		f.walMu.Lock()
 		walBatch, err := f.wal.Drain(batchSize - len(out))
+		f.walMu.Unlock()
 		if err != nil {
 			f.logger.Warn("wal drain failed", "event", "wal_drain_error", "err", err.Error())
 		} else {
@@ -190,6 +232,15 @@ func (f *Flusher) pullBatch() []postgres.Message {
 
 // flushWithRetry calls pg.CopyMessages with backoff; on terminal failure
 // hands every message to the dead-letter sink.
+//
+// Note: we do NOT wrap each attempt with an extra context timeout. pgx
+// already enforces `connect_timeout` for new connections and TCP-level
+// keep-alives for existing ones. Adding a layer-7 timeout on top causes
+// false retries during slow-but-healthy recovery (every flush that
+// takes more than the chosen threshold gets a context.DeadlineExceeded
+// even if PG would have completed it shortly after). Mode transitions
+// are driven by recordLatency() observing actual completed flush
+// durations — that handles "slow but working" correctly.
 func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) {
 	delay := time.Second
 	var lastErr error
@@ -212,8 +263,17 @@ func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) 
 		if err == nil {
 			f.m.Flushed.Inc()
 			f.m.Inserted.Add(float64(inserted))
-			f.recordLatency(latency)
+			// Order matters: maybeRecover *first* clears critical-from-
+			// error so subsequent recordLatency can promote based on the
+			// actual measured latency. The previous order
+			// (recordLatency → maybeRecover) caused mode to oscillate
+			// elevated→critical→elevated for every successful but slow
+			// flush, because maybeRecover would always undo a fresh
+			// latency-based critical promotion. Net result: the
+			// gauge reads "elevated" between flushes even when p95 is
+			// well above the critical threshold.
 			f.maybeRecover()
+			f.recordLatency(latency)
 			return
 		}
 
@@ -227,7 +287,37 @@ func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) 
 		f.enterCritical()
 	}
 
-	// Out of retries — hand the batch to the dead-letter sink.
+	// Out of retries. Distinguish transient (connection/latency) errors
+	// from poison (per-row constraint or data-exception) errors:
+	//
+	//   • transient + WAL available -> push the batch back into the WAL
+	//     and let the next critical-mode-recovery cycle pick it up. This
+	//     is the at-least-once contract: connection blips must NOT
+	//     terminate as DLQ. See docs/adr/0005-sustained-slowdown-stress-test.md.
+	//   • poison, or transient with no WAL -> dead-letter, because
+	//     replaying the same payload will hit the same error.
+	if !isPoisonError(lastErr) && f.wal != nil {
+		f.logger.Warn("retries exhausted; re-enqueuing batch to WAL",
+			"event", "requeue_to_wal",
+			"batch", len(batch),
+			"err", lastErr.Error())
+		var requeueErr error
+		for _, msg := range batch {
+			if _, err := f.wal.Append(msg); err != nil {
+				requeueErr = err
+				break
+			}
+			f.m.Requeued.Inc()
+		}
+		if requeueErr == nil {
+			return
+		}
+		// WAL itself is failing — fall through to dead-letter as last resort.
+		f.logger.Error("WAL re-enqueue failed; dead-lettering instead",
+			"event", "wal_requeue_failed",
+			"err", requeueErr.Error())
+	}
+
 	f.logger.Error("retries exhausted; dead-lettering batch",
 		"event", "dead_letter",
 		"batch", len(batch),
@@ -242,6 +332,31 @@ func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) 
 		}
 		f.m.DeadLettered.Inc()
 	}
+}
+
+// isPoisonError reports whether err is a deterministic per-row failure
+// that will not succeed on replay regardless of how long we wait.
+// PostgreSQL SQLSTATE classes:
+//
+//	22xxx  Data Exception           (e.g. invalid encoding)
+//	23xxx  Integrity Constraint     (e.g. dedup_key collision is not
+//	                                 here — it's collapsed by ON CONFLICT
+//	                                 before we ever see it; CHECK / FK
+//	                                 violations would be)
+//
+// Everything else (connect refused, timeout, network unreachable, server
+// shutdown) is transient and worth retrying via the WAL.
+func isPoisonError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "23") {
+			return true
+		}
+	}
+	return false
 }
 
 // --- mode + latency tracking ------------------------------------------------

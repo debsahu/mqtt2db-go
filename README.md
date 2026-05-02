@@ -4,12 +4,36 @@ High-throughput Go service that subscribes to MQTT topics on a Comqtt cluster an
 
 ## Status
 
-v0.1.0 — initial public release. See [CHANGELOG.md](CHANGELOG.md) for what
-shipped. 63 unit tests + 6 integration tests pass against real Comqtt
-v2.6.2 + Postgres 17 + RustFS via testcontainers. A self-contained stress
-test under `test/stress/` validated 600,000 messages over 30s @ 20K msg/s
-with zero internal loss; the buffer correctly spilled to WAL when the
-ring hit 80% and drained the WAL fully on recovery.
+v0.1.0 shipped. v0.1.1 in review — sustained-slowdown stress test,
+flusher transient-failure handling, per-connection cached staging,
+and parallel flusher workers. See [CHANGELOG.md](CHANGELOG.md) for
+the full list.
+
+66 unit tests + 6 integration tests pass against real Comqtt v2.6.2 +
+Postgres 17 + RustFS via testcontainers.
+
+**Steady-state stress** (`test/stress/`): 600,000 messages over 30s @
+20K msg/s with zero internal loss; the buffer correctly spilled to WAL
+when the ring hit 80% and drained the WAL fully on recovery.
+
+**Sustained-slowdown stress** (`test/stress/slowdown/`, three scenarios
+via toxiproxy at the full **10 K msg/s** the milestone calls for, all
+6/6 success criteria pass per scenario):
+- moderate (+300 ms): mode reaches elevated, zero DLQ, WAL peak 0,
+  drain 18 s
+- severe (+2.5 s): mode reaches critical, subscriber paused, WAL peak
+  ~2.4 M, zero DLQ, drain 19 m 56 s
+- outage (TCP rejected): mode critical, subscriber paused, WAL peak
+  ~1.7 M, zero DLQ, drain 8 m 02 s
+
+Conservation (`distinct == flusher.inserted`) is exact in every
+scenario. The post-recovery drain rate sits at ~25 K rows/sec on
+M1-class hardware after the per-connection cached staging
+(`AfterConnect` hook) and parallel-worker (`flusher.workers`) changes
+in ADR 0005. `make stress-slowdown-quick` runs the same scenarios at
+2 K msg/s for fast development feedback.
+
+Each scenario writes a Markdown report to `test/stress/slowdown/results/`.
 
 ## Architecture at a Glance
 
@@ -52,6 +76,9 @@ go run ./cmd/mqtt2db-go --config=config.dev.yaml
 
 # In another terminal, generate load
 go run ./test/loadgen --rate=1000 --duration=30s --devices=100
+
+# (One-time) enable the pre-push lint+vet+test hook
+make hooks
 ```
 
 ## Configuration

@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho"
@@ -70,6 +71,10 @@ type Subscriber struct {
 	// clientID is computed once at New and reused so reconnects keep the
 	// same session.
 	clientID string
+
+	// paused tracks edge-triggered transitions for the Paused gauge so
+	// Pauses (counter) only increments on the rising edge.
+	paused atomic.Bool
 }
 
 // New constructs a Subscriber. Callers pass already-built dependencies so
@@ -260,14 +265,23 @@ func (s *Subscriber) HandleMessage(topic string, payload []byte, ack func()) {
 }
 
 // routeMessage applies the spill/pause policy from CLAUDE.md. Returns
-// true if the message is durably held and we may ack.
+// true if the message is durably held and we may ack. As a side effect,
+// it manages the Paused gauge: it goes to 1 whenever the post-enqueue
+// ring state is StatePause (ring is at pause-threshold capacity, ≥95% by
+// default) or whenever the ring + WAL both refuse a message. It returns
+// to 0 the moment we route a message and the ring is back below the
+// pause threshold.
 func (s *Subscriber) routeMessage(msg postgres.Message) bool {
 	state, err := s.ring.Enqueue(msg)
 	if err == nil {
-		// Above the spill threshold, future incoming messages should
-		// prefer WAL — but the ring still had room for *this* one, so
-		// we ack and let the next message take the WAL path if needed.
-		_ = state
+		// Track ring state for the Paused gauge so operators can
+		// alert on "ring in pause-threshold range" without waiting
+		// for the rarer ack-drop event.
+		if state == buffer.StatePause {
+			s.markPaused()
+		} else {
+			s.clearPause()
+		}
 		return true
 	}
 	if !errors.Is(err, buffer.ErrFull) {
@@ -281,6 +295,7 @@ func (s *Subscriber) routeMessage(msg postgres.Message) bool {
 	if s.wal != nil {
 		if _, walErr := s.wal.Append(msg); walErr == nil {
 			s.ring.MarkSpilled()
+			s.clearPause()
 			return true
 		} else {
 			s.logger.Error("wal append failed",
@@ -290,7 +305,25 @@ func (s *Subscriber) routeMessage(msg postgres.Message) bool {
 	}
 
 	// Pause + nowhere to spill. Drop ack so Comqtt redelivers.
+	s.markPaused()
 	return false
+}
+
+// markPaused / clearPause toggle the Paused gauge with edge-trigger
+// counting on the rising edge so dashboards can graph pause-event rate.
+// We use a sync/atomic flag instead of grabbing s.mu so the hot path
+// stays lock-free.
+func (s *Subscriber) markPaused() {
+	if s.paused.CompareAndSwap(false, true) {
+		s.m.Paused.Set(1)
+		s.m.Pauses.Inc()
+	}
+}
+
+func (s *Subscriber) clearPause() {
+	if s.paused.CompareAndSwap(true, false) {
+		s.m.Paused.Set(0)
+	}
 }
 
 // computeClientID joins the configured prefix with the host identity. In

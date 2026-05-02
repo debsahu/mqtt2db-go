@@ -7,6 +7,74 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-02
+
+### Added
+
+- **Sustained-slowdown stress test** (Milestone 13). New harness under
+  `test/stress/slowdown/` drives the full pipeline through three
+  scenarios using toxiproxy as a fault injector between the flusher and
+  Postgres:
+  * **moderate** — +300 ms latency for 5 minutes
+  * **severe** — +2.5 s latency for 5 minutes
+  * **outage** — TCP rejected for 3 minutes
+  Each run produces a Markdown report under
+  `test/stress/slowdown/results/`. `make stress-slowdown` runs all
+  three at full duration; `make stress-slowdown-quick` shrinks the
+  windows for development feedback.
+
+- `mqtt2db_flusher_requeued_total` counter — records messages
+  re-enqueued to the WAL after a transient terminal flush failure (so
+  operators can distinguish real flusher errors from connection blips).
+
+- `mqtt2db_subscriber_paused` gauge and `mqtt2db_subscriber_pauses_total`
+  counter — track when the subscriber is dropping unacked messages
+  because the ring is full and the WAL refused them.
+
+### Changed
+
+- **Flusher transient-failure handling** (ADR 0005). When
+  `MaxRetries` is exhausted against a connection-level error, the batch
+  is now re-enqueued to the WAL via the new `WALSource.Append` method
+  rather than dead-lettered. Dead-letter is reserved for deterministic
+  poison (SQLSTATE 22xxx data exceptions, 23xxx integrity violations).
+  This fixes a bug where a sustained PG outage of more than ~31 seconds
+  would dead-letter every batch, in violation of the "do not silently
+  drop" contract from CLAUDE.md.
+
+- `flusher.WALSource` interface gained an `Append(msg) ([]byte, error)`
+  method. `wal.Store` already exposed it; the change is non-breaking
+  for production code but is a small breaking change for anyone who
+  implemented their own `WALSource` (none in tree).
+
+- **Per-connection cached staging table** (ADR 0005). The pgx pool now
+  installs `mqtt2db_staging` once per real connection via
+  `pgxpool.Config.AfterConnect`, with `ON COMMIT DELETE ROWS` so it is
+  empty at the start of every transaction. This removes the per-batch
+  `CREATE TEMP TABLE` round trip that dominated flusher overhead at
+  high throughput. The CopyFrom + ON CONFLICT staging hop is preserved.
+
+- **Parallel flusher workers** (ADR 0005). New `flusher.workers`
+  config field (default 1) spawns N worker goroutines, each running an
+  independent `pull → flush` loop. Mode transitions and the WAL drain
+  are mutex-protected; everything else is lock-free. With
+  `max_conns: 8` and `workers: 7` the pipeline now sustains ~25K
+  rows/sec post-recovery on M1-class hardware (was ~5K rows/sec).
+
+### Stress-test results (10K msg/s, full duration)
+
+All three sustained-slowdown scenarios pass at the milestone-target
+10K msg/s with the A′ + B improvements above:
+
+| scenario | toxic    | duration | WAL peak  | drain  | criteria  |
+|----------|----------|----------|-----------|--------|-----------|
+| moderate | +300 ms  | 10m26s   | 0         | 18s    | 5/5 PASS  |
+| severe   | +2.5 s   | 30m05s   | 2,419,545 | 19m56s | 6/6 PASS  |
+| outage   | TCP rej. | 16m07s   | 1,721,213 | 8m02s  | 6/6 PASS  |
+
+Conservation (`distinct == flusher.inserted`) is exact in every
+scenario; zero messages dead-lettered for transient PG issues.
+
 ## [0.1.0] - 2026-05-01
 
 Initial public release. Subscribes to a Comqtt MQTT 5 cluster via shared

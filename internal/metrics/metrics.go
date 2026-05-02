@@ -133,6 +133,8 @@ func NewWALMetrics(reg prometheus.Registerer) *WALMetrics {
 // SubscriberMetrics is the metric set the MQTT subscriber exports.
 type SubscriberMetrics struct {
 	Connected     prometheus.Gauge   // 1 if currently connected, 0 otherwise
+	Paused        prometheus.Gauge   // 1 when ring is at pause threshold AND WAL spill failed (we are not acking)
+	Pauses        prometheus.Counter // number of pause events (transitions into Paused=1)
 	Reconnects    prometheus.Counter // reconnection attempts (successful or not)
 	Received      prometheus.Counter // messages delivered to our handler
 	Acked         prometheus.Counter // messages we manually acked
@@ -145,6 +147,14 @@ func NewSubscriberMetrics(reg prometheus.Registerer) *SubscriberMetrics {
 		Connected: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: Namespace, Subsystem: "subscriber",
 			Name: "connected", Help: "1 when connected to the MQTT broker, 0 otherwise.",
+		}),
+		Paused: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: "subscriber",
+			Name: "paused", Help: "1 when the subscriber is dropping unacked messages so the broker redelivers (ring full + no WAL headroom).",
+		}),
+		Pauses: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: Namespace, Subsystem: "subscriber",
+			Name: "pauses_total", Help: "Pause events (transitions from acking to not acking).",
 		}),
 		Reconnects: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: Namespace, Subsystem: "subscriber",
@@ -163,7 +173,7 @@ func NewSubscriberMetrics(reg prometheus.Registerer) *SubscriberMetrics {
 			Name: "handler_errors_total", Help: "Handler-level errors (topic parse failures, encode errors).",
 		}),
 	}
-	reg.MustRegister(m.Connected, m.Reconnects, m.Received, m.Acked, m.HandlerErrors)
+	reg.MustRegister(m.Connected, m.Paused, m.Pauses, m.Reconnects, m.Received, m.Acked, m.HandlerErrors)
 	return m
 }
 
@@ -177,6 +187,7 @@ type FlusherMetrics struct {
 	FlushErrors  prometheus.Counter   // batch flushes that errored
 	RetriesTotal prometheus.Counter   // total per-batch retry attempts
 	DeadLettered prometheus.Counter   // messages handed off to dead-letter
+	Requeued     prometheus.Counter   // messages re-enqueued to the WAL after a transient terminal failure
 }
 
 // NewFlusherMetrics registers the flusher metric set on reg.
@@ -216,9 +227,13 @@ func NewFlusherMetrics(reg prometheus.Registerer) *FlusherMetrics {
 			Namespace: Namespace, Subsystem: "flusher",
 			Name: "dead_lettered_total", Help: "Messages handed off to the dead-letter sink.",
 		}),
+		Requeued: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: Namespace, Subsystem: "flusher",
+			Name: "requeued_total", Help: "Messages re-enqueued to the WAL after a transient terminal flush failure.",
+		}),
 	}
 	reg.MustRegister(m.BatchSize, m.Mode, m.FlushLatency, m.Flushed, m.Inserted,
-		m.FlushErrors, m.RetriesTotal, m.DeadLettered)
+		m.FlushErrors, m.RetriesTotal, m.DeadLettered, m.Requeued)
 	return m
 }
 

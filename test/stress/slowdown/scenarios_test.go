@@ -63,9 +63,11 @@ func runScenario(t *testing.T, h *Harness, opt scenarioOpts) {
 	defer cancel()
 
 	report := scenarioReport{
-		Scenario:   opt.name,
-		StartedAt:  time.Now(),
-		TargetRate: rate,
+		Scenario:     opt.name,
+		StartedAt:    time.Now(),
+		TargetRate:   rate,
+		Schema:       string(activeSchema()),
+		PayloadBytes: payloadSize(),
 	}
 
 	tlCtx, tlCancel := context.WithCancel(ctx)

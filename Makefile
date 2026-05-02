@@ -90,6 +90,42 @@ stress-oscillation-quick: ## Same scenarios, abbreviated timings — for develop
 	    SLOWDOWN_OSC_SLOW=45s SLOWDOWN_OSC_CLEAN=45s SLOWDOWN_OSC_CYCLES=3 \
 	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationSlow$$' ./test/stress/slowdown/
 
+.PHONY: stress-realistic
+stress-realistic: ## Realistic schema sweep (Milestone 14b). All M13 + M14a scenarios @ telemetry_wide + 4KB payloads.
+	# Five scenarios in sequence, each with SLOWDOWN_SCHEMA=wide so
+	# the harness applies the embedded telemetry_wide DDL and points
+	# the Copier + verification queries at it. 4 KB payloads.
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    go test -tags=slowdown -count=1 -timeout=45m -v -run='^TestSlowdown_Moderate$$' ./test/stress/slowdown/
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    go test -tags=slowdown -count=1 -timeout=45m -v -run='^TestSlowdown_Severe$$'   ./test/stress/slowdown/
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    go test -tags=slowdown -count=1 -timeout=45m -v -run='^TestSlowdown_Outage$$'   ./test/stress/slowdown/
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    go test -tags=slowdown -count=1 -timeout=90m -v -run='^TestSlowdown_OscillationFast$$' ./test/stress/slowdown/
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    go test -tags=slowdown -count=1 -timeout=120m -v -run='^TestSlowdown_OscillationSlow$$' ./test/stress/slowdown/
+
+.PHONY: stress-realistic-quick
+stress-realistic-quick: ## Same wide-schema sweep, abbreviated timings — for development feedback.
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    SLOWDOWN_WARMUP=20s SLOWDOWN_TOXIC=60s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_Moderate$$' ./test/stress/slowdown/
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    SLOWDOWN_WARMUP=20s SLOWDOWN_TOXIC=60s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_Severe$$'   ./test/stress/slowdown/
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    SLOWDOWN_WARMUP=20s SLOWDOWN_TOXIC=60s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_Outage$$'   ./test/stress/slowdown/
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    SLOWDOWN_WARMUP=20s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    SLOWDOWN_OSC_SLOW=15s SLOWDOWN_OSC_CLEAN=15s SLOWDOWN_OSC_CYCLES=3 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationFast$$' ./test/stress/slowdown/
+	SLOWDOWN_SCHEMA=wide SLOWDOWN_PAYLOAD_BYTES=4096 \
+	    SLOWDOWN_WARMUP=20s SLOWDOWN_DRAIN=60s SLOWDOWN_RATE=2000 \
+	    SLOWDOWN_OSC_SLOW=45s SLOWDOWN_OSC_CLEAN=45s SLOWDOWN_OSC_CYCLES=3 \
+	    go test -tags=slowdown -count=1 -timeout=20m -v -run='^TestSlowdown_OscillationSlow$$' ./test/stress/slowdown/
+
 .PHONY: cover
 cover: ## Generate coverage report at coverage.out / coverage.html
 	go test -race -coverprofile=coverage.out ./internal/...

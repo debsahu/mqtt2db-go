@@ -172,6 +172,12 @@ func setupHarness(t *testing.T, ctx context.Context, scenarioName string) *Harne
 	require.NoError(t, postgres.Migrate("file://"+migrationsDir(t), pgHostDSN))
 	createBucket(t, ctx, dlqEndpoint, dlqAccess, dlqSecret, "mqtt2db-go-dlq")
 
+	// Test-only wide-schema DDL (Milestone 14b). No-op when
+	// SLOWDOWN_SCHEMA != wide. Embedded in the harness rather than
+	// living under migrations/ so production operators never see it.
+	t.Logf("[%s] schema=%s table=%s payload_bytes=%d",
+		scenarioName, activeSchema(), targetTable(), payloadSize())
+
 	proxyDSN := fmt.Sprintf("postgres://ingest:ingest@127.0.0.1:%s/telemetry?sslmode=disable&connect_timeout=5", proxyHostPort)
 
 	toxiClient := toxiclient.NewClient(toxiHostAddr)
@@ -184,8 +190,13 @@ func setupHarness(t *testing.T, ctx context.Context, scenarioName string) *Harne
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
+	// Apply wide-schema DDL through the same proxy pool so the
+	// flusher's CopyMessages path will see the table (PG schema cache
+	// is per-connection). No-op for minimal mode.
+	require.NoError(t, applyWideSchemaIfNeeded(ctx, pool))
+
 	copier, err := postgres.NewCopier(pool, config.PostgresConfig{
-		Schema: "public", Table: "telemetry",
+		Schema: "public", Table: targetTable(),
 		Columns: []string{"tenant_id", "device_uuid", "topic", "payload", "received_at", "dedup_key"},
 	})
 	require.NoError(t, err)
@@ -331,6 +342,7 @@ func (h *Harness) driveLoad(ctx context.Context, rate int, duration time.Duratio
 	loadCtx, loadCancel := context.WithTimeout(ctx, duration)
 	defer loadCancel()
 
+	bodyBytes := payloadSize()
 	var sent, errs atomic.Int64
 	var wg sync.WaitGroup
 	for i, cm := range h.publishers {
@@ -340,7 +352,7 @@ func (h *Harness) driveLoad(ctx context.Context, rate int, duration time.Duratio
 			r := rand.New(rand.NewSource(time.Now().UnixNano() ^ int64(idx))) //nolint:gosec
 			interval := time.Second / time.Duration(perPub)
 			next := time.Now()
-			body := make([]byte, 128)
+			body := make([]byte, bodyBytes)
 			for {
 				select {
 				case <-loadCtx.Done():
@@ -444,7 +456,8 @@ func (h *Harness) markTimeline(note string) {
 
 func (h *Harness) rowCount(ctx context.Context) int64 {
 	var n int64
-	if err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM telemetry`).Scan(&n); err != nil {
+	q := fmt.Sprintf(`SELECT count(*) FROM %s`, targetTable())
+	if err := h.Pool.QueryRow(ctx, q).Scan(&n); err != nil {
 		h.t.Fatalf("rowCount: %v", err)
 	}
 	return n
@@ -452,7 +465,8 @@ func (h *Harness) rowCount(ctx context.Context) int64 {
 
 func (h *Harness) distinctDedupKeys(ctx context.Context) int64 {
 	var n int64
-	if err := h.Pool.QueryRow(ctx, `SELECT count(distinct dedup_key) FROM telemetry`).Scan(&n); err != nil {
+	q := fmt.Sprintf(`SELECT count(distinct dedup_key) FROM %s`, targetTable())
+	if err := h.Pool.QueryRow(ctx, q).Scan(&n); err != nil {
 		h.t.Fatalf("distinctDedupKeys: %v", err)
 	}
 	return n
@@ -489,7 +503,8 @@ func (h *Harness) awaitFullDrain(ctx context.Context, initialPeak int64, budget 
 		ringDepth := int64(testutil.ToFloat64(h.BufM.Depth))
 		acked := int64(testutil.ToFloat64(h.SubM.Acked))
 		var rows int64
-		if err := h.Pool.QueryRow(ctx, `SELECT count(distinct dedup_key) FROM telemetry`).Scan(&rows); err != nil {
+		q := fmt.Sprintf(`SELECT count(distinct dedup_key) FROM %s`, targetTable())
+		if err := h.Pool.QueryRow(ctx, q).Scan(&rows); err != nil {
 			continue
 		}
 		if time.Since(last) >= 10*time.Second {
@@ -594,6 +609,13 @@ type scenarioReport struct {
 	Pass             []string
 	Fail             []string
 
+	// Schema records which test schema this run used (minimal /
+	// wide). Operators reading the report should know whether the
+	// throughput numbers were produced against secondary-index
+	// loaded tables or the lab schema.
+	Schema       string
+	PayloadBytes int
+
 	// Cycles is populated only by oscillation scenarios. nil for the
 	// existing one-shot moderate / severe / outage runs.
 	Cycles []cycleStats
@@ -667,6 +689,9 @@ func writeReport(t *testing.T, r scenarioReport) {
 		r.EndedAt.UTC().Format(time.RFC3339),
 		r.EndedAt.Sub(r.StartedAt).Round(time.Second))
 	fmt.Fprintf(&b, "## Headline\n\n")
+	if r.Schema != "" {
+		fmt.Fprintf(&b, "- Schema:         %s (%d-byte payloads)\n", r.Schema, r.PayloadBytes)
+	}
 	fmt.Fprintf(&b, "- Target rate:    %d msg/s\n", r.TargetRate)
 	fmt.Fprintf(&b, "- Sent:           %d\n", r.Sent)
 	fmt.Fprintf(&b, "- Publish errors: %d\n", r.PublishErrs)
@@ -678,6 +703,23 @@ func writeReport(t *testing.T, r scenarioReport) {
 	fmt.Fprintf(&b, "- WAL drained fully: %v\n", r.WALDrainedFully)
 	if r.DrainTime > 0 {
 		fmt.Fprintf(&b, "- Drain time:     %s\n", r.DrainTime.Round(time.Second))
+	}
+
+	// Throughput section — rows/sec and bytes/sec computed from
+	// flusher.inserted_total / total runtime. bytes/sec uses the
+	// configured payload size; this slightly under-counts the true
+	// row width (excludes the topic, dedup_key, etc.) but is the
+	// honest "ingest payload throughput" number an operator wants.
+	if r.FlusherInserted > 0 {
+		runtime := r.EndedAt.Sub(r.StartedAt).Seconds()
+		if runtime > 0 {
+			rps := float64(r.FlusherInserted) / runtime
+			bps := rps * float64(r.PayloadBytes)
+			fmt.Fprintf(&b, "\n## Throughput\n\n")
+			fmt.Fprintf(&b, "- rows/sec:  %.0f\n", rps)
+			fmt.Fprintf(&b, "- bytes/sec: %.0f (~%.2f MB/s payload-only)\n",
+				bps, bps/(1024*1024))
+		}
 	}
 	fmt.Fprintf(&b, "\n## Pass / Fail\n\n")
 	for _, p := range r.Pass {

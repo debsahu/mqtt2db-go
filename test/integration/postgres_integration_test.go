@@ -98,7 +98,8 @@ func TestMigrate_UpDownVersion(t *testing.T) {
 
 	v, dirty, err = postgres.Version(source, dsn)
 	require.NoError(t, err)
-	assert.Equal(t, uint(1), v)
+	// Latest migration in ./migrations — bump when a new file is added.
+	assert.Equal(t, uint(2), v)
 	assert.False(t, dirty)
 
 	// Idempotent re-up.

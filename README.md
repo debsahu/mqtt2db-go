@@ -87,6 +87,35 @@ metrics:
   listen: :9090
 ```
 
+## Topic Format
+
+Devices must publish to topics shaped exactly like:
+
+```
+t/{tenant}/d/{device_uuid}/evt/{anything/you/want}
+```
+
+Concrete example:
+
+```
+t/acme/d/550e8400-e29b-41d4-a716-446655440000/evt/sensors/temp
+```
+
+Rules the parser enforces:
+
+- `{tenant}` — 1–64 chars from `[a-zA-Z0-9_-]` (no whitespace, no
+  unicode, no MQTT wildcards).
+- `{device_uuid}` — must parse as a UUID (any version).
+- Total topic length ≤ 1024 bytes.
+- The literal segments `t`, `d`, and `evt` are required at positions
+  1, 3, and 5.
+
+Anything that doesn't match these rules is preserved in the
+`telemetry_unparseable` side-table (see Operational Properties below)
+rather than landing in the main `telemetry` table — so firmware bugs
+are debuggable, not silent. The shape itself is part of the device
+contract and intentionally not configurable.
+
 ## Operational Properties
 
 - **Delivery**: at-least-once. Downstream consumers must handle duplicates.

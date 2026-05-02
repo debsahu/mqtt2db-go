@@ -61,7 +61,7 @@ func TestParseTopic_RejectsByClass(t *testing.T) {
 		{"plus_tenant", "t/+/d/+/evt/#", subscriber.TopicErrTenantInvalid},
 		{"hash_tenant", "t/#/d/" + id + "/evt/state", subscriber.TopicErrTenantInvalid},
 		{"space_tenant", "t/ /d/" + id + "/evt/state", subscriber.TopicErrTenantInvalid},
-		{"slash_tenant_via_extra_segment", "t/acme prod/d/" + id + "/evt/state", subscriber.TopicErrTenantInvalid},
+		{"space_in_multichar_tenant", "t/acme prod/d/" + id + "/evt/state", subscriber.TopicErrTenantInvalid},
 		{"unicode_tenant", "t/café/d/" + id + "/evt/state", subscriber.TopicErrTenantInvalid},
 		{"oversized_tenant", "t/" + strings.Repeat("a", subscriber.MaxTenantLen+1) + "/d/" + id + "/evt/state", subscriber.TopicErrTenantInvalid},
 

@@ -87,6 +87,13 @@ type FlusherConfig struct {
 	CriticalLatencyThreshold Duration `yaml:"critical_latency_threshold" env:"CRITICAL_LATENCY_THRESHOLD"`
 	RecoveryWindow           Duration `yaml:"recovery_window"            env:"RECOVERY_WINDOW"`
 	MaxRetries               int      `yaml:"max_retries"                env:"MAX_RETRIES"`
+	// Workers controls the number of parallel flush goroutines. Each
+	// worker independently pulls a batch from the ring or WAL and runs
+	// CopyMessages on its own pgxpool connection. Default 1 (serial)
+	// preserves backwards-compatible behavior; production configs at
+	// 10K msg/s should set this to MaxConns - 1 (typically 7) so the
+	// flusher can saturate the pool.
+	Workers int `yaml:"workers" env:"WORKERS"`
 }
 
 // DeadLetterConfig configures the S3-compatible sink.
@@ -169,6 +176,7 @@ func NewDefault() Config {
 			CriticalLatencyThreshold: Duration(2 * time.Second),
 			RecoveryWindow:           Duration(60 * time.Second),
 			MaxRetries:               5,
+			Workers:                  1,
 		},
 		DeadLetter: DeadLetterConfig{
 			S3: S3Config{

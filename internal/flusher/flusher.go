@@ -98,6 +98,13 @@ type Flusher struct {
 	latencyWindow  []time.Duration // recent flush latencies for p95
 	windowCapacity int             // size of the rolling window
 
+	// walMu serializes WAL.Drain calls across workers so two workers
+	// don't read the same key range and double-flush. CopyMessages
+	// itself is parallelism-safe (each call acquires its own pool conn,
+	// and PG's unique index on dedup_key collapses any incidental
+	// duplicates).
+	walMu sync.Mutex
+
 	// allow injecting a clock for tests
 	now func() time.Time
 }
@@ -141,24 +148,50 @@ func New(
 	}, nil
 }
 
-// Run blocks until ctx is canceled. Each tick pulls up to BatchSize from
-// the source (and the WAL if non-nil), flushes once, and updates mode
-// based on observed latency.
+// Run blocks until ctx is canceled. Spawns cfg.Workers parallel flush
+// goroutines (default 1). Each worker independently pulls a batch from
+// the ring or WAL and runs CopyMessages against its own pgxpool
+// connection. Mode transitions and the critical-mode gate stay
+// serialized through f.mu, so workers cooperate on global state but
+// parallelize the I/O path.
 func (f *Flusher) Run(ctx context.Context) error {
+	workers := f.cfg.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+
 	f.m.Mode.Set(float64(ModeNormal))
 	f.m.BatchSize.Set(float64(f.cfg.BatchSize))
 	f.logger.Info("started", "event", "started",
 		"batch_size", f.cfg.BatchSize,
-		"flush_interval", f.cfg.FlushInterval.AsDuration())
+		"flush_interval", f.cfg.FlushInterval.AsDuration(),
+		"workers", workers)
 
-	timer := time.NewTimer(f.cfg.FlushInterval.AsDuration())
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			f.workerLoop(ctx, id)
+		}(i)
+	}
+	wg.Wait()
+	f.logger.Info("stopped", "event", "stopped")
+	return nil
+}
+
+// workerLoop is the per-goroutine flush loop. Concurrent calls to
+// pullBatch are safe (the ring and WAL are individually thread-safe;
+// pullBatch serializes WAL.Drain via f.walMu so two workers don't
+// duplicate-read the same key range). flushWithRetry uses its own
+// pgxpool acquisition so workers don't queue on a single connection.
+func (f *Flusher) workerLoop(ctx context.Context, id int) {
+	timer := time.NewTimer(f.flushIntervalForMode())
 	defer timer.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			f.logger.Info("stopped", "event", "stopped")
-			return nil
+			return
 		case <-timer.C:
 		}
 
@@ -179,12 +212,15 @@ func (f *Flusher) Run(ctx context.Context) error {
 }
 
 // pullBatch reads from the ring first and tops up from the WAL if there's
-// headroom. Bounded by the active batch size.
+// headroom. Bounded by the active batch size. WAL drains are serialized
+// across workers so two parallel flushers don't read the same WAL keys.
 func (f *Flusher) pullBatch() []postgres.Message {
 	batchSize := f.batchSizeForMode()
 	out := f.src.Dequeue(batchSize)
 	if f.wal != nil && len(out) < batchSize {
+		f.walMu.Lock()
 		walBatch, err := f.wal.Drain(batchSize - len(out))
+		f.walMu.Unlock()
 		if err != nil {
 			f.logger.Warn("wal drain failed", "event", "wal_drain_error", "err", err.Error())
 		} else {

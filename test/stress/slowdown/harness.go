@@ -236,6 +236,7 @@ func setupHarness(t *testing.T, ctx context.Context, scenarioName string) *Harne
 		CriticalLatencyThreshold: config.Duration(2 * time.Second),
 		RecoveryWindow:           config.Duration(60 * time.Second),
 		MaxRetries:               5,
+		Workers:                  7, // MaxConns(8) - 1 — see ADR 0005.
 	}, copier, ring, walStore, dlq, flushM, nil)
 	require.NoError(t, err)
 

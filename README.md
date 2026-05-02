@@ -76,6 +76,9 @@ go run ./cmd/mqtt2db-go --config=config.dev.yaml
 
 # In another terminal, generate load
 go run ./test/loadgen --rate=1000 --duration=30s --devices=100
+
+# (One-time) enable the pre-push lint+vet+test hook
+make hooks
 ```
 
 ## Configuration

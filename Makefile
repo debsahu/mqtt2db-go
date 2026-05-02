@@ -81,6 +81,11 @@ cover: ## Generate coverage report at coverage.out / coverage.html
 lint: ## Run golangci-lint
 	golangci-lint run ./...
 
+.PHONY: hooks
+hooks: ## Enable repo git hooks (pre-push lint+vet+test)
+	git config core.hooksPath .githooks
+	@echo "git hooks enabled at .githooks/ — bypass with 'git push --no-verify' or SKIP_PRE_PUSH=1"
+
 .PHONY: fmt
 fmt: ## Format Go sources with gofmt and goimports
 	gofmt -s -w .

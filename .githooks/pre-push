@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the same lint + vet + unit tests CI runs.
+# Bypass with `git push --no-verify` when you must.
+set -euo pipefail
+
+if [[ -n "${SKIP_PRE_PUSH:-}" ]]; then
+    echo "pre-push: skipped via SKIP_PRE_PUSH"
+    exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+if ! command -v golangci-lint >/dev/null 2>&1; then
+    echo "pre-push: golangci-lint not found on PATH." >&2
+    echo "  install: brew install golangci-lint  (or see https://golangci-lint.run/welcome/install/)" >&2
+    echo "  bypass:  git push --no-verify" >&2
+    exit 1
+fi
+
+echo "pre-push: golangci-lint run ./..."
+golangci-lint run ./...
+
+echo "pre-push: go vet ./..."
+go vet ./...
+
+echo "pre-push: go test ./internal/..."
+go test -count=1 ./internal/...

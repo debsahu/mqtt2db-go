@@ -170,10 +170,10 @@ func (f *Flusher) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
-			f.workerLoop(ctx, id)
-		}(i)
+			f.workerLoop(ctx)
+		}()
 	}
 	wg.Wait()
 	f.logger.Info("stopped", "event", "stopped")
@@ -185,7 +185,7 @@ func (f *Flusher) Run(ctx context.Context) error {
 // pullBatch serializes WAL.Drain via f.walMu so two workers don't
 // duplicate-read the same key range). flushWithRetry uses its own
 // pgxpool acquisition so workers don't queue on a single connection.
-func (f *Flusher) workerLoop(ctx context.Context, id int) {
+func (f *Flusher) workerLoop(ctx context.Context) {
 	timer := time.NewTimer(f.flushIntervalForMode())
 	defer timer.Stop()
 	for {

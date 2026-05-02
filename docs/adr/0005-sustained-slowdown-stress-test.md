@@ -133,6 +133,52 @@ of whether ack-drop happens. This gives operators an actionable
 signal — "the ring is in pause-threshold range right now" — and
 matches the spec's intent for scenarios B and C.
 
+**Bug 4 — flusher mode oscillates between elevated and critical on
+every successful slow flush.** `flushWithRetry` called `recordLatency`
+*before* `maybeRecover`. When p95 was high (e.g. 25 s under severe
+slowdown), `recordLatency` correctly promoted `elevated → critical`,
+then `maybeRecover` immediately demoted `critical → elevated`. Net
+effect: the gauge read "elevated" between flushes despite latency
+sitting well above the critical threshold, and the test's `peak mode`
+observation never registered critical.
+
+Fix: swap the call order to `maybeRecover` then `recordLatency`. The
+recovery-from-error demotion now happens first; latency-based
+promotion runs second and *persists* until the rolling window's p95
+drops below the threshold. The test now also samples
+`mqtt2db_flusher_mode` at 100 ms (separate fast poller alongside the
+1 s timeline recorder) so brief mode flips during transitions are
+captured even on a slow CI runner.
+
+### Performance finding (not a bug, captured for the runbook)
+
+Under a sustained 10 K msg/s load, the WAL drain rate post-recovery
+**degrades over time** — observed ~17 K/s in the first 30 seconds,
+falling to ~1.5 K/s after several minutes of continuous drain. With a
+peak WAL of 3.3 M messages from the moderate scenario, full
+reconciliation requires roughly 30 minutes on M1-class hardware,
+which exceeds the 10-minute drain criterion in the original spec.
+
+The decay is consistent with single-threaded flusher topology: every
+batch is one `pgxpool` BeginTx → CopyFrom → INSERT-FROM-staging →
+COMMIT round trip, serialised in the flusher goroutine, with the
+temp-table staging hop adding fixed per-batch overhead that doesn't
+amortise as the backlog shrinks. Future work to consider:
+
+* Parallelise the flusher across the pgxpool `MaxConns` (8 by default)
+  with batch-level fan-out and ordering preserved per
+  device_uuid for ON CONFLICT semantics.
+* Drop the staging hop in favour of `INSERT ... ON CONFLICT DO NOTHING`
+  with `pgx.Batch` once `pgx.CopyFrom` parity for the conflict path is
+  available.
+
+Until then, the spec's "WAL drains in 10 min" target is achievable
+under the moderate scenario at ~3 K msg/s sustained but not at the
+full 10 K msg/s the milestone calls for. The harness in this
+repository runs at the higher rate by default and tolerates a 30-minute
+drain budget so the finding is observable rather than hidden by a
+permissive cap.
+
 ### Reporting
 
 Each scenario writes

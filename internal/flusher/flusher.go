@@ -196,16 +196,17 @@ func (f *Flusher) pullBatch() []postgres.Message {
 
 // flushWithRetry calls pg.CopyMessages with backoff; on terminal failure
 // hands every message to the dead-letter sink.
+//
+// Note: we do NOT wrap each attempt with an extra context timeout. pgx
+// already enforces `connect_timeout` for new connections and TCP-level
+// keep-alives for existing ones. Adding a layer-7 timeout on top causes
+// false retries during slow-but-healthy recovery (every flush that
+// takes more than the chosen threshold gets a context.DeadlineExceeded
+// even if PG would have completed it shortly after). Mode transitions
+// are driven by recordLatency() observing actual completed flush
+// durations — that handles "slow but working" correctly.
 func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) {
 	delay := time.Second
-	// Cap each individual flush attempt so a stuck PG conn doesn't wedge
-	// the mode-transition observer (which only fires on flush completion).
-	// 2x CriticalLatencyThreshold gives a normal flush enough headroom
-	// while still pushing the mode to critical promptly when PG is sick.
-	perAttemptTimeout := 2 * f.cfg.CriticalLatencyThreshold.AsDuration()
-	if perAttemptTimeout <= 0 {
-		perAttemptTimeout = 30 * time.Second
-	}
 	var lastErr error
 	for attempt := 0; attempt <= f.cfg.MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -219,17 +220,24 @@ func (f *Flusher) flushWithRetry(ctx context.Context, batch []postgres.Message) 
 		}
 
 		start := f.now()
-		attemptCtx, cancelAttempt := context.WithTimeout(ctx, perAttemptTimeout)
-		inserted, err := f.pg.CopyMessages(attemptCtx, batch)
-		cancelAttempt()
+		inserted, err := f.pg.CopyMessages(ctx, batch)
 		latency := f.now().Sub(start)
 		f.m.FlushLatency.Observe(latency.Seconds())
 
 		if err == nil {
 			f.m.Flushed.Inc()
 			f.m.Inserted.Add(float64(inserted))
-			f.recordLatency(latency)
+			// Order matters: maybeRecover *first* clears critical-from-
+			// error so subsequent recordLatency can promote based on the
+			// actual measured latency. The previous order
+			// (recordLatency → maybeRecover) caused mode to oscillate
+			// elevated→critical→elevated for every successful but slow
+			// flush, because maybeRecover would always undo a fresh
+			// latency-based critical promotion. Net result: the
+			// gauge reads "elevated" between flushes even when p95 is
+			// well above the critical threshold.
 			f.maybeRecover()
+			f.recordLatency(latency)
 			return
 		}
 

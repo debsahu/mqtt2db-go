@@ -16,12 +16,21 @@ Postgres 17 + RustFS via testcontainers.
 when the ring hit 80% and drained the WAL fully on recovery.
 
 **Sustained-slowdown stress** (`test/stress/slowdown/`, three scenarios
-via toxiproxy):
-- moderate (+300 ms): flusher elevated → normal, zero DLQ, drain in seconds
-- severe (+2.5 s): flusher elevated → critical → recovery, WAL peaked
-  at ~130K messages, zero DLQ, drain in ~30s
-- outage (TCP rejected): flusher critical, subscriber paused, WAL
-  absorbed full traffic, zero DLQ, drain in seconds after recovery
+via toxiproxy). At 2 K msg/s (`stress-slowdown-quick`) all 6/6 success
+criteria pass per scenario:
+- moderate (+300 ms): mode reaches elevated, zero DLQ, drain in 3 s
+- severe (+2.5 s): mode reaches critical, subscriber paused, WAL peak
+  ~130 K, zero DLQ, drain in 30 s
+- outage (TCP rejected): mode critical, subscriber paused, WAL peak
+  ~83 K, zero DLQ, drain in 4 s
+
+At the full 10 K msg/s the milestone calls for (`stress-slowdown`),
+all but the drain-time criterion pass. The flusher's serial
+`BeginTx → CopyFrom → INSERT-FROM-staging → COMMIT` topology
+sustains ~5 K msg/s post-recovery on M1-class hardware, so 3 M-row
+backlogs take ~30 min to fully reconcile. ADR 0005 captures this as
+a known performance limitation with proposed mitigations
+(flusher parallelism / staging-hop removal).
 
 Each scenario writes a Markdown report to `test/stress/slowdown/results/`.
 

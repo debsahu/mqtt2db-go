@@ -97,6 +97,11 @@ func run() error {
 		return fmt.Errorf("postgres copier: %w", err)
 	}
 
+	unparseableWriter, err := postgres.NewUnparseableWriter(pool, cfg.Postgres)
+	if err != nil {
+		return fmt.Errorf("postgres unparseable writer: %w", err)
+	}
+
 	// --- WAL ---
 	walStore, err := wal.Open(wal.Config{
 		Path:             cfg.Badger.Path,
@@ -137,6 +142,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("subscriber: %w", err)
 	}
+	sub.SetUnparseableInserter(unparseableWriter)
 
 	// --- Health server ---
 	healthSrv := health.NewServer(cfg.Health.Listen, cfg.Health.LivenessPath, cfg.Health.ReadinessPath, logger)

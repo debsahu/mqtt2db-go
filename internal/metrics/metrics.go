@@ -132,13 +132,15 @@ func NewWALMetrics(reg prometheus.Registerer) *WALMetrics {
 
 // SubscriberMetrics is the metric set the MQTT subscriber exports.
 type SubscriberMetrics struct {
-	Connected     prometheus.Gauge   // 1 if currently connected, 0 otherwise
-	Paused        prometheus.Gauge   // 1 when ring is at pause threshold AND WAL spill failed (we are not acking)
-	Pauses        prometheus.Counter // number of pause events (transitions into Paused=1)
-	Reconnects    prometheus.Counter // reconnection attempts (successful or not)
-	Received      prometheus.Counter // messages delivered to our handler
-	Acked         prometheus.Counter // messages we manually acked
-	HandlerErrors prometheus.Counter // handler-level errors (parse failures, etc.)
+	Connected               prometheus.Gauge       // 1 if currently connected, 0 otherwise
+	Paused                  prometheus.Gauge       // 1 when ring is at pause threshold AND WAL spill failed (we are not acking)
+	Pauses                  prometheus.Counter     // number of pause events (transitions into Paused=1)
+	Reconnects              prometheus.Counter     // reconnection attempts (successful or not)
+	Received                prometheus.Counter     // messages delivered to our handler
+	Acked                   prometheus.Counter     // messages we manually acked
+	HandlerErrors           prometheus.Counter     // handler-level errors (parse failures, etc.) — kept for backwards compat with v0.1.1 dashboards
+	UnparseableInserted     *prometheus.CounterVec // parse failures successfully written to telemetry_unparseable, labeled by error_class
+	UnparseableInsertErrors prometheus.Counter     // parse failures we tried to preserve but the insert failed (we ack anyway, so the message is lost)
 }
 
 // NewSubscriberMetrics registers the subscriber metric set on reg.
@@ -172,8 +174,22 @@ func NewSubscriberMetrics(reg prometheus.Registerer) *SubscriberMetrics {
 			Namespace: Namespace, Subsystem: "subscriber",
 			Name: "handler_errors_total", Help: "Handler-level errors (topic parse failures, encode errors).",
 		}),
+		UnparseableInserted: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: Namespace, Subsystem: "subscriber",
+			Name: "unparseable_inserted_total",
+			Help: "Parse failures successfully preserved in telemetry_unparseable, by error_class.",
+		}, []string{"error_class"}),
+		UnparseableInsertErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: Namespace, Subsystem: "subscriber",
+			Name: "unparseable_insert_errors_total",
+			Help: "Parse failures whose preservation insert into telemetry_unparseable failed (the message is then acked-and-lost to keep the queue moving).",
+		}),
 	}
-	reg.MustRegister(m.Connected, m.Paused, m.Pauses, m.Reconnects, m.Received, m.Acked, m.HandlerErrors)
+	reg.MustRegister(
+		m.Connected, m.Paused, m.Pauses, m.Reconnects,
+		m.Received, m.Acked, m.HandlerErrors,
+		m.UnparseableInserted, m.UnparseableInsertErrors,
+	)
 	return m
 }
 

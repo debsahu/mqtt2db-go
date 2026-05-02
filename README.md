@@ -94,6 +94,7 @@ metrics:
 - **Backpressure**: slow PostgreSQL slows MQTT consumption; Comqtt buffers or redelivers via shared subscription.
 - **Horizontal scaling**: deploy N replicas of this service; the shared subscription distributes load.
 - **Failure recovery**: replica loss is recoverable (Comqtt redelivers); local Badger volume loss may lose unflushed messages within the configured WAL window.
+- **Malformed messages**: if a message arrives with a topic that doesn't match the expected shape (wrong tenant format, bad device UUID, etc.), it's preserved in a `telemetry_unparseable` side-table — original topic, payload, and reason intact — instead of being discarded. Lets you debug device firmware after the fact.
 
 ## Scaling: When You Need More Throughput
 

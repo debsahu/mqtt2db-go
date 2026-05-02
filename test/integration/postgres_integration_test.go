@@ -174,6 +174,96 @@ func TestCopyMessages_PersistsAndDedups(t *testing.T) {
 	assert.Equal(t, int64(0), inserted)
 }
 
+func TestMigrate_TelemetryUnparseableExists(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	dsn := startPostgres(t, ctx)
+	require.NoError(t, postgres.Migrate("file://"+migrationsDir(t), dsn))
+
+	pool, err := postgres.NewPool(ctx, config.PostgresConfig{DSN: dsn, MaxConns: 2, MinConns: 1})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	// to_regclass returns NULL when the table doesn't exist; a non-NULL
+	// result confirms migration 0002 ran.
+	var name *string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT to_regclass('public.telemetry_unparseable')::text`).Scan(&name))
+	require.NotNil(t, name)
+	assert.Equal(t, "telemetry_unparseable", *name)
+}
+
+func TestInsertUnparseable_PersistsRow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	dsn := startPostgres(t, ctx)
+	require.NoError(t, postgres.Migrate("file://"+migrationsDir(t), dsn))
+
+	pool, err := postgres.NewPool(ctx, config.PostgresConfig{DSN: dsn, MaxConns: 2, MinConns: 1})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	w, err := postgres.NewUnparseableWriter(pool, config.PostgresConfig{Schema: "public"})
+	require.NoError(t, err)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	row := postgres.Unparseable{
+		Topic:       "t/+/d/+/evt/#",
+		Payload:     []byte(`{"junk":true}`),
+		ErrorClass:  "tenant_invalid",
+		ErrorDetail: "+",
+		ReceivedAt:  now,
+	}
+	require.NoError(t, w.InsertUnparseable(ctx, row))
+
+	var (
+		topic, errorClass string
+		payload           []byte
+		errorDetail       *string
+		receivedAt        time.Time
+	)
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT topic, payload, error_class, error_detail, received_at
+		FROM telemetry_unparseable
+		ORDER BY id DESC LIMIT 1`,
+	).Scan(&topic, &payload, &errorClass, &errorDetail, &receivedAt))
+
+	assert.Equal(t, row.Topic, topic)
+	assert.Equal(t, row.Payload, payload)
+	assert.Equal(t, row.ErrorClass, errorClass)
+	require.NotNil(t, errorDetail)
+	assert.Equal(t, "+", *errorDetail)
+	assert.WithinDuration(t, now, receivedAt, time.Second)
+}
+
+func TestInsertUnparseable_EmptyDetailIsNull(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	dsn := startPostgres(t, ctx)
+	require.NoError(t, postgres.Migrate("file://"+migrationsDir(t), dsn))
+
+	pool, err := postgres.NewPool(ctx, config.PostgresConfig{DSN: dsn, MaxConns: 2, MinConns: 1})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	w, err := postgres.NewUnparseableWriter(pool, config.PostgresConfig{Schema: "public"})
+	require.NoError(t, err)
+
+	now := time.Now().UTC()
+	require.NoError(t, w.InsertUnparseable(ctx, postgres.Unparseable{
+		Topic:      "garbage",
+		Payload:    []byte(`p`),
+		ErrorClass: "topic_structure",
+		ReceivedAt: now,
+	}))
+
+	var detail *string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT error_detail FROM telemetry_unparseable ORDER BY id DESC LIMIT 1`,
+	).Scan(&detail))
+	assert.Nil(t, detail, "empty ErrorDetail must persist as NULL")
+}
+
 // BenchmarkCopyMessages_100K reports throughput for a single 100K-row
 // batch. Run with:
 //

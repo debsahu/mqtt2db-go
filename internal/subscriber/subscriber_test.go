@@ -1,6 +1,8 @@
 package subscriber_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -145,6 +147,70 @@ func TestHandleMessage_BadTopicAcks(t *testing.T) {
 	assert.Empty(t, w.Snapshot())
 	assert.Equal(t, int64(1), acked.Load(), "bad topic acks so the broker drops it")
 	assert.Equal(t, float64(1), testutil.ToFloat64(m.HandlerErrors))
+}
+
+// fakeUnparseable implements subscriber.UnparseableInserter.
+type fakeUnparseable struct {
+	mu      sync.Mutex
+	rows    []postgres.Unparseable
+	failErr error
+}
+
+func (f *fakeUnparseable) InsertUnparseable(_ context.Context, row postgres.Unparseable) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failErr != nil {
+		return f.failErr
+	}
+	f.rows = append(f.rows, row)
+	return nil
+}
+func (f *fakeUnparseable) Snapshot() []postgres.Unparseable {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]postgres.Unparseable(nil), f.rows...)
+}
+
+func TestHandleMessage_BadTopicWritesUnparseable(t *testing.T) {
+	ring := &fakeRing{}
+	w := &fakeWAL{}
+	sub, m := newSub(t, ring, w)
+	un := &fakeUnparseable{}
+	sub.SetUnparseableInserter(un)
+
+	var acked atomic.Int64
+	sub.HandleMessage("t/+/d/+/evt/#", []byte(`bad`), func() { acked.Add(1) })
+
+	rows := un.Snapshot()
+	require.Len(t, rows, 1)
+	assert.Equal(t, "t/+/d/+/evt/#", rows[0].Topic)
+	assert.Equal(t, []byte(`bad`), rows[0].Payload)
+	assert.Equal(t, subscriber.TopicErrTenantInvalid, rows[0].ErrorClass)
+	assert.False(t, rows[0].ReceivedAt.IsZero())
+
+	assert.Equal(t, int64(1), acked.Load(), "preserved unparseable still acks")
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.HandlerErrors), "handler_errors_total still increments")
+	assert.Equal(t, float64(1),
+		testutil.ToFloat64(m.UnparseableInserted.WithLabelValues(subscriber.TopicErrTenantInvalid)))
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.UnparseableInsertErrors))
+}
+
+func TestHandleMessage_BadTopicInsertFailureStillAcks(t *testing.T) {
+	ring := &fakeRing{}
+	w := &fakeWAL{}
+	sub, m := newSub(t, ring, w)
+	un := &fakeUnparseable{failErr: errors.New("pg down")}
+	sub.SetUnparseableInserter(un)
+
+	var acked atomic.Int64
+	sub.HandleMessage("not-even-close", []byte(`x`), func() { acked.Add(1) })
+
+	assert.Empty(t, un.Snapshot())
+	assert.Equal(t, int64(1), acked.Load(),
+		"insert failure must still ack to keep the queue moving")
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.UnparseableInsertErrors))
+	assert.Equal(t, float64(0),
+		testutil.ToFloat64(m.UnparseableInserted.WithLabelValues(subscriber.TopicErrStructure)))
 }
 
 func TestNew_RequiresDeps(t *testing.T) {

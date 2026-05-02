@@ -7,6 +7,60 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-02
+
+### Added
+
+- **`telemetry_unparseable` side-table** (ADR 0006). Messages whose
+  MQTT topic cannot be parsed into `(tenant_id, device_uuid)` are now
+  preserved in a new Postgres table instead of being logged + acked +
+  dropped. The row carries the original topic, payload, an
+  `error_class` tag, optional `error_detail`, and both `received_at`
+  and `inserted_at`. Operators can triage with
+  `SELECT error_class, count(*) FROM telemetry_unparseable GROUP BY
+  error_class`. Migration: `migrations/0002_telemetry_unparseable.{up,down}.sql`.
+
+- `mqtt2db_subscriber_unparseable_inserted_total{error_class="..."}`
+  counter — successful preservation events, labelled by class.
+- `mqtt2db_subscriber_unparseable_insert_errors_total` counter —
+  cases where the side-table insert itself failed (the message is
+  then acked-and-lost to avoid poisoning the queue).
+- New runbook section "Unparseable messages climbing" with diagnosis
+  queries and resolution paths.
+
+### Changed
+
+- **Strict topic-criteria parser** (ADR 0006). `ParseTopic` now
+  rejects topics longer than 1024 bytes, and tenants outside
+  `^[a-zA-Z0-9_-]{1,64}$` (whitespace, MQTT wildcards, unicode,
+  oversize). Previously any non-empty tenant string was accepted.
+  Devices publishing such topics in v0.1.1 will now route to
+  `telemetry_unparseable` instead of polluting `telemetry`. Also:
+  parse failures return `*subscriber.TopicParseError` with a typed
+  `Class` field; `errors.Is(err, ErrBadTopic)` still works for the
+  yes/no check.
+
+- `subscriber.Subscriber` gained a `SetUnparseableInserter` method
+  used by `cmd/mqtt2db-go/main.go` to wire up
+  `postgres.NewUnparseableWriter`. When unset (the v0.1.1 default)
+  parse failures fall back to the previous log + ack + drop behavior,
+  so existing consumers and tests are unaffected.
+
+- `mqtt2db_subscriber_handler_errors_total` is unchanged — it still
+  ticks on every parse failure, regardless of whether the
+  preservation insert succeeded. This keeps existing dashboards
+  meaningful.
+
+### Operational notes
+
+- `telemetry_unparseable` has no built-in retention. Operators
+  should set a periodic `DELETE` (e.g. 30-day retention via cron) —
+  same model as `telemetry` itself.
+- The strict tenant rule is a behavior change. Any deployment
+  with tenants outside `[a-zA-Z0-9_-]` should expect a one-time
+  spike in `unparseable_inserted_total{error_class="tenant_invalid"}`
+  on upgrade until firmware/registry is updated.
+
 ## [0.1.1] - 2026-05-02
 
 ### Added

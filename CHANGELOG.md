@@ -7,6 +7,109 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Oscillation stress test** (Milestone 14a). New scenarios in
+  `test/stress/slowdown/oscillation_test.go` drive the pipeline
+  through repeated slow→clean cycles via toxiproxy:
+  * `TestSlowdown_OscillationFast` — 6 cycles of 30 s slow / 30 s
+    clean (both windows shorter than `RecoveryWindow=60s`). Asserts
+    the flusher reaches at least elevated mode during each slow
+    window and that mode-transition count stays bounded (no
+    ping-pong). Does NOT assert recovery — the windows are too short
+    for that by construction.
+  * `TestSlowdown_OscillationSlow` — 6 cycles of 90 s slow / 90 s
+    clean (both windows longer than `RecoveryWindow`). Same
+    "reaches elevated" assertion plus an explicit recovery check:
+    at least one cycle from cycle 2 onwards must end its clean
+    window with mode=normal. Without this, the test would pass even
+    if recovery never completed.
+  Per-scenario report writes a per-cycle table to
+  `test/stress/slowdown/results/`.
+  `make stress-oscillation` runs both at full duration;
+  `make stress-oscillation-quick` shrinks the windows for development
+  feedback.
+
+- **Ratchet detector**: assertion that WAL depth at the END of each
+  clean window does not grow monotonically across cycles. Catches the
+  failure mode where each clean window leaves more in the WAL than
+  the previous, which would surface as ever-growing drain times in
+  steady-state. Unit-tested in `oscillation_unit_test.go` against
+  healthy / transient-spike / true-ratchet / plateau patterns.
+
+- **Mode-flap detector**: assertion that the flusher transitions
+  between modes no more than `4 × cycles + 4` times in a run, sampled
+  at 100 ms (the 1 Hz timeline aliases sub-second flips). Catches
+  hysteresis bugs where a tight RecoveryWindow makes the flusher
+  oscillate faster than the duty cycle. Allows up to four transitions
+  per cycle to cover the natural normal → critical → elevated →
+  normal walk under sustained toxic latency.
+
+- **Realistic-schema stress sweep** (Milestone 14b, ADR 0007). The
+  v0.1.1 / v0.1.2 stress numbers were measured against the minimal
+  `telemetry` schema (1 unique + 2 btree indexes, ~10-byte payloads).
+  External feedback was right that secondary indexes and wider rows
+  are where lab numbers fall apart. v0.1.3 adds:
+  * **`telemetry_wide` test schema** — same six base columns as
+    `telemetry` (so the existing `postgres.Copier` writes to either
+    table without changes) plus four realistic columns
+    (`schema_version`, `content_type`, `region`, generated
+    `payload_size_bytes`) and **two extra secondary indexes**
+    (`(tenant_id, content_type, received_at DESC)` and
+    `(region, received_at DESC)`).
+  * The DDL is **embedded in the test harness**, not under
+    `migrations/`, so production operators running `cmd/migrate up`
+    never accidentally create the test artifact. See ADR 0007 §2.
+  * `SLOWDOWN_SCHEMA=wide` switches the harness to apply the
+    embedded DDL and target `telemetry_wide`. Default `minimal`
+    preserves M13/M14a behavior exactly.
+  * `SLOWDOWN_PAYLOAD_BYTES` configures synthetic publish-body
+    size; default 128 (lab) and `make stress-realistic` sets it to
+    4096 (mid-range IoT telemetry).
+  * `make stress-realistic` runs the full M13 + M14a sweep at the
+    wide schema; `make stress-realistic-quick` is the development
+    variant.
+
+- **Throughput section in scenario reports** — every report now
+  carries `rows/sec` and `bytes/sec` (~MB/s payload-only) computed
+  over total runtime. Bytes/sec is the more useful number for PG-side
+  capacity sizing once payload sizes vary.
+
+### Stress-test results — wide schema, quick sweep (2K msg/s, 4 KB payloads)
+
+All five scenarios pass on M1-class hardware with the wide schema:
+
+| scenario | sent | persisted | wal_peak | drain | rows/sec | MB/s | criteria |
+|----------|------|-----------|---------:|------:|---------:|-----:|----------|
+| moderate | 280,013 | 280,013 | 0 | 2 s | 1,968 | 7.69 | 5/5 PASS |
+| severe | 280,000 | 280,000 | 131,116 | 2 s | 1,967 | 7.68 | 6/6 PASS |
+| outage | 280,003 | 280,001 | 157,100 | 2 s | 1,966 | 7.68 | 6/6 PASS |
+| oscillation-fast (3 cyc × 15s/15s) | 340,008 | 340,007 | 111,700 | 2 s | 1,967 | 7.68 | 5/5 PASS |
+| oscillation-slow (3 cyc × 45s/45s) | 700,005 | 697,998 | 142,164 | 39 s | 1,785 | 6.97 | 5/5 PASS |
+
+At quick parameters the producer (2 K msg/s) stays inside the
+flusher's drain capacity even with the wide schema, so we are not
+exercising drain-rate limits — we ARE verifying that correctness
+invariants (zero DLQ, exact conservation, no ratcheting, no flapping)
+hold when secondary indexes and 4 KB payloads are added. To
+characterize the realistic drain rate, operators should run
+`make stress-realistic` (full duration at 10 K msg/s).
+
+### Operational notes
+
+- Both oscillation scenarios and the realistic sweep are gated by
+  the existing `slowdown` build tag — they don't run by default.
+  Same isolation as the M13 scenarios. Toxiproxy + Postgres + Comqtt
+  + RustFS testcontainers are required; the existing `make` targets
+  handle them.
+
+- The wide-schema DDL is intentionally **not** a `migrations/` file.
+  Mixing test-only schema artifacts with production migrations is a
+  foot-gun an operator should not have to defend against. Anyone
+  embedding `mqtt2db-go` in their own pipeline can run
+  `cmd/migrate up` against a production database and be confident
+  no `telemetry_wide` table appears.
+
 ## [0.1.2] - 2026-05-02
 
 ### Added

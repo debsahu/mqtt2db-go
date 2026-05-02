@@ -112,6 +112,20 @@ type Harness struct {
 	timeline []TimelineEvent
 	tlMu     sync.Mutex
 
+	// fastPeakWAL is the highest WAL outstanding seen by the 100 ms
+	// fast poller since startTimelineRecorder began. Oscillation
+	// scenarios reset this at each cycle boundary so cs.WALPeakInCycle
+	// captures sub-second spikes the 1 Hz timeline misses. Read /
+	// reset only via SnapshotAndResetPeakWAL; do NOT compare-and-swap
+	// from the cycle loop while the poller is running.
+	fastPeakWAL atomic.Int64
+
+	// fastModeTransitions counts mode changes observed by the same
+	// 100 ms poller. The 1 Hz timeline aliases sub-second flips down
+	// to a single sample, so the M14a mode-flap detector reads this
+	// counter, not the 1 Hz transition count.
+	fastModeTransitions atomic.Int64
+
 	// peakMode tracks the highest mode value observed at any sampling
 	// instant by startTimelineRecorder. We poll faster (every 100ms)
 	// just for this so brief mode oscillations don't escape the test.
@@ -155,6 +169,12 @@ func setupHarness(t *testing.T, ctx context.Context, scenarioName string) *Harne
 	publishers := envInt("STRESS_PUBLISHERS", 16)
 	devices := envInt("STRESS_DEVICES", 1000)
 
+	// Validate operator-facing knobs once, at startup. Both helpers
+	// fail the test fatally on invalid input so a typo in a make
+	// recipe (or env export) never silently runs the wrong benchmark.
+	_ = activeSchemaTB(t)
+	_ = payloadSizeTB(t)
+
 	t.Logf("[%s] booting infrastructure...", scenarioName)
 	dockerNet, err := network.New(ctx)
 	require.NoError(t, err)
@@ -172,6 +192,12 @@ func setupHarness(t *testing.T, ctx context.Context, scenarioName string) *Harne
 	require.NoError(t, postgres.Migrate("file://"+migrationsDir(t), pgHostDSN))
 	createBucket(t, ctx, dlqEndpoint, dlqAccess, dlqSecret, "mqtt2db-go-dlq")
 
+	// Test-only wide-schema DDL (Milestone 14b). No-op when
+	// SLOWDOWN_SCHEMA != wide. Embedded in the harness rather than
+	// living under migrations/ so production operators never see it.
+	t.Logf("[%s] schema=%s table=%s payload_bytes=%d",
+		scenarioName, activeSchema(), targetTable(), payloadSize())
+
 	proxyDSN := fmt.Sprintf("postgres://ingest:ingest@127.0.0.1:%s/telemetry?sslmode=disable&connect_timeout=5", proxyHostPort)
 
 	toxiClient := toxiclient.NewClient(toxiHostAddr)
@@ -184,8 +210,13 @@ func setupHarness(t *testing.T, ctx context.Context, scenarioName string) *Harne
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
+	// Apply wide-schema DDL through the same proxy pool so the
+	// flusher's CopyMessages path will see the table (PG schema cache
+	// is per-connection). No-op for minimal mode.
+	require.NoError(t, applyWideSchemaIfNeeded(ctx, pool))
+
 	copier, err := postgres.NewCopier(pool, config.PostgresConfig{
-		Schema: "public", Table: "telemetry",
+		Schema: "public", Table: targetTable(),
 		Columns: []string{"tenant_id", "device_uuid", "topic", "payload", "received_at", "dedup_key"},
 	})
 	require.NoError(t, err)
@@ -331,6 +362,7 @@ func (h *Harness) driveLoad(ctx context.Context, rate int, duration time.Duratio
 	loadCtx, loadCancel := context.WithTimeout(ctx, duration)
 	defer loadCancel()
 
+	bodyBytes := payloadSize()
 	var sent, errs atomic.Int64
 	var wg sync.WaitGroup
 	for i, cm := range h.publishers {
@@ -340,7 +372,7 @@ func (h *Harness) driveLoad(ctx context.Context, rate int, duration time.Duratio
 			r := rand.New(rand.NewSource(time.Now().UnixNano() ^ int64(idx))) //nolint:gosec
 			interval := time.Second / time.Duration(perPub)
 			next := time.Now()
-			body := make([]byte, 128)
+			body := make([]byte, bodyBytes)
 			for {
 				select {
 				case <-loadCtx.Done():
@@ -403,10 +435,15 @@ func (h *Harness) startTimelineRecorder(ctx context.Context) {
 			}
 		}
 	}()
-	// Fast peak-mode poller: 100ms cadence, only writes the atomic.
+	// Fast 100 ms poller: peak mode (gauge), peak WAL (gauge), and
+	// fine-grained mode-transition count. The 1 Hz timeline aliases
+	// sub-second mode flips to a single sample; this poller catches
+	// them. Only writes atomics so it stays lock-free against the
+	// hot path.
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
+		var lastMode int32 = -1
 		for {
 			select {
 			case <-ctx.Done():
@@ -419,9 +456,38 @@ func (h *Harness) startTimelineRecorder(ctx context.Context) {
 						break
 					}
 				}
+				if lastMode != -1 && m != lastMode {
+					h.fastModeTransitions.Add(1)
+				}
+				lastMode = m
+
+				wal := int64(testutil.ToFloat64(h.WalM.Appended) - testutil.ToFloat64(h.WalM.Drained))
+				if wal < 0 {
+					wal = 0
+				}
+				for {
+					prev := h.fastPeakWAL.Load()
+					if wal <= prev || h.fastPeakWAL.CompareAndSwap(prev, wal) {
+						break
+					}
+				}
 			}
 		}
 	}()
+}
+
+// SnapshotAndResetPeakWAL atomically reads the highest WAL outstanding
+// observed since the last reset, then resets the tracker to the
+// current WAL depth. Oscillation scenarios call this at each cycle
+// boundary so cs.WALPeakInCycle is a true sub-second peak, not a
+// 1 Hz alias.
+func (h *Harness) SnapshotAndResetPeakWAL() int64 {
+	cur := h.walOutstanding()
+	prev := h.fastPeakWAL.Swap(cur)
+	if prev > cur {
+		return prev
+	}
+	return cur
 }
 
 func (h *Harness) appendTimeline(e TimelineEvent) {
@@ -444,7 +510,8 @@ func (h *Harness) markTimeline(note string) {
 
 func (h *Harness) rowCount(ctx context.Context) int64 {
 	var n int64
-	if err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM telemetry`).Scan(&n); err != nil {
+	q := fmt.Sprintf(`SELECT count(*) FROM %s`, targetTable())
+	if err := h.Pool.QueryRow(ctx, q).Scan(&n); err != nil {
 		h.t.Fatalf("rowCount: %v", err)
 	}
 	return n
@@ -452,7 +519,8 @@ func (h *Harness) rowCount(ctx context.Context) int64 {
 
 func (h *Harness) distinctDedupKeys(ctx context.Context) int64 {
 	var n int64
-	if err := h.Pool.QueryRow(ctx, `SELECT count(distinct dedup_key) FROM telemetry`).Scan(&n); err != nil {
+	q := fmt.Sprintf(`SELECT count(distinct dedup_key) FROM %s`, targetTable())
+	if err := h.Pool.QueryRow(ctx, q).Scan(&n); err != nil {
 		h.t.Fatalf("distinctDedupKeys: %v", err)
 	}
 	return n
@@ -489,7 +557,8 @@ func (h *Harness) awaitFullDrain(ctx context.Context, initialPeak int64, budget 
 		ringDepth := int64(testutil.ToFloat64(h.BufM.Depth))
 		acked := int64(testutil.ToFloat64(h.SubM.Acked))
 		var rows int64
-		if err := h.Pool.QueryRow(ctx, `SELECT count(distinct dedup_key) FROM telemetry`).Scan(&rows); err != nil {
+		q := fmt.Sprintf(`SELECT count(distinct dedup_key) FROM %s`, targetTable())
+		if err := h.Pool.QueryRow(ctx, q).Scan(&rows); err != nil {
 			continue
 		}
 		if time.Since(last) >= 10*time.Second {
@@ -533,6 +602,48 @@ func (h *Harness) observePeak(prev int64) int64 {
 	return prev
 }
 
+// walOutstanding returns the current WAL depth (appended − drained).
+// Cheap; used by oscillation scenarios to sample at slow-window
+// boundaries without going through the full snapshot path.
+func (h *Harness) walOutstanding() int64 {
+	wal := int64(testutil.ToFloat64(h.WalM.Appended) - testutil.ToFloat64(h.WalM.Drained))
+	if wal < 0 {
+		wal = 0
+	}
+	return wal
+}
+
+// currentMode returns the flusher's current mode as a string.
+func (h *Harness) currentMode() string {
+	switch int(testutil.ToFloat64(h.FlushM.Mode)) {
+	case 1:
+		return "elevated"
+	case 2:
+		return "critical"
+	default:
+		return "normal"
+	}
+}
+
+// walPeakBetween scans the timeline for the highest WAL outstanding
+// observed within [start, end]. Used by oscillation scenarios to
+// detect ratcheting across cycles. Caller must take h.tlMu if it
+// needs a stable snapshot; here we read under the lock briefly.
+func (h *Harness) walPeakBetween(start, end time.Time) int64 {
+	h.tlMu.Lock()
+	defer h.tlMu.Unlock()
+	var peak float64
+	for _, e := range h.timeline {
+		if e.At.Before(start) || e.At.After(end) {
+			continue
+		}
+		if e.WAL > peak {
+			peak = e.WAL
+		}
+	}
+	return int64(peak)
+}
+
 type scenarioReport struct {
 	Scenario         string
 	StartedAt        time.Time
@@ -551,6 +662,35 @@ type scenarioReport struct {
 	Snapshots        []reportSnapshot
 	Pass             []string
 	Fail             []string
+
+	// Schema records which test schema this run used (minimal /
+	// wide). Operators reading the report should know whether the
+	// throughput numbers were produced against secondary-index
+	// loaded tables or the lab schema.
+	Schema       string
+	PayloadBytes int
+
+	// Cycles is populated only by oscillation scenarios. nil for the
+	// existing one-shot moderate / severe / outage runs.
+	Cycles []cycleStats
+}
+
+// cycleStats captures one slow→clean cycle of an oscillation scenario.
+// Used to detect WAL ratcheting (peak monotonically growing) and mode
+// thrashing across cycles.
+type cycleStats struct {
+	Cycle              int
+	SlowStartAt        time.Time
+	SlowEndAt          time.Time
+	CleanEndAt         time.Time
+	StartMode          string // mode at the moment toxic was applied
+	SlowEndMode        string // mode at the moment toxic was removed
+	CleanEndMode       string // mode at the end of the clean window
+	WALAtSlowStart     int64
+	WALPeakInCycle     int64 // observed peak between SlowStartAt and CleanEndAt
+	WALAtCleanEnd      int64
+	InsertedInCycle    int64 // delta of flusher.inserted_total over the cycle
+	BatchSizeAtSlowEnd float64
 }
 
 type reportSnapshot struct {
@@ -603,6 +743,9 @@ func writeReport(t *testing.T, r scenarioReport) {
 		r.EndedAt.UTC().Format(time.RFC3339),
 		r.EndedAt.Sub(r.StartedAt).Round(time.Second))
 	fmt.Fprintf(&b, "## Headline\n\n")
+	if r.Schema != "" {
+		fmt.Fprintf(&b, "- Schema:         %s (%d-byte payloads)\n", r.Schema, r.PayloadBytes)
+	}
 	fmt.Fprintf(&b, "- Target rate:    %d msg/s\n", r.TargetRate)
 	fmt.Fprintf(&b, "- Sent:           %d\n", r.Sent)
 	fmt.Fprintf(&b, "- Publish errors: %d\n", r.PublishErrs)
@@ -615,6 +758,23 @@ func writeReport(t *testing.T, r scenarioReport) {
 	if r.DrainTime > 0 {
 		fmt.Fprintf(&b, "- Drain time:     %s\n", r.DrainTime.Round(time.Second))
 	}
+
+	// Throughput section — rows/sec and bytes/sec computed from
+	// flusher.inserted_total / total runtime. bytes/sec uses the
+	// configured payload size; this slightly under-counts the true
+	// row width (excludes the topic, dedup_key, etc.) but is the
+	// honest "ingest payload throughput" number an operator wants.
+	if r.FlusherInserted > 0 {
+		runtime := r.EndedAt.Sub(r.StartedAt).Seconds()
+		if runtime > 0 {
+			rps := float64(r.FlusherInserted) / runtime
+			bps := rps * float64(r.PayloadBytes)
+			fmt.Fprintf(&b, "\n## Throughput\n\n")
+			fmt.Fprintf(&b, "- rows/sec:  %.0f\n", rps)
+			fmt.Fprintf(&b, "- bytes/sec: %.0f (~%.2f MB/s payload-only)\n",
+				bps, bps/(1024*1024))
+		}
+	}
 	fmt.Fprintf(&b, "\n## Pass / Fail\n\n")
 	for _, p := range r.Pass {
 		fmt.Fprintf(&b, "- ✅ %s\n", p)
@@ -622,6 +782,18 @@ func writeReport(t *testing.T, r scenarioReport) {
 	for _, f := range r.Fail {
 		fmt.Fprintf(&b, "- ❌ %s\n", f)
 	}
+	if len(r.Cycles) > 0 {
+		fmt.Fprintf(&b, "\n## Per-cycle Stats (oscillation)\n\n")
+		fmt.Fprintf(&b, "| cycle | slow_start_mode | slow_end_mode | clean_end_mode | wal_start | wal_peak | wal_clean_end | inserted | batch@slow_end |\n")
+		fmt.Fprintf(&b, "|------:|:----------------|:--------------|:---------------|---------:|--------:|-------------:|--------:|--------------:|\n")
+		for _, c := range r.Cycles {
+			fmt.Fprintf(&b, "| %5d | %s | %s | %s | %d | %d | %d | %d | %.0f |\n",
+				c.Cycle, c.StartMode, c.SlowEndMode, c.CleanEndMode,
+				c.WALAtSlowStart, c.WALPeakInCycle, c.WALAtCleanEnd,
+				c.InsertedInCycle, c.BatchSizeAtSlowEnd)
+		}
+	}
+
 	fmt.Fprintf(&b, "\n## Mode Transitions\n\n")
 	fmt.Fprintf(&b, "Sampled every second. Rows emitted on mode change OR on a `note` (toxic add/remove, end of phase).\n\n")
 	fmt.Fprintf(&b, "| t (s) | mode | batch | ring | wal | paused | note |\n")

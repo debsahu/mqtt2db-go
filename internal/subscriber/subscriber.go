@@ -57,14 +57,29 @@ type WAL interface {
 	Append(m postgres.Message) ([]byte, error)
 }
 
+// UnparseableInserter is the subset of postgres.UnparseableWriter the
+// subscriber needs to preserve messages whose topic could not be
+// parsed. Optional — when nil, parse failures are logged + acked +
+// dropped (the v0.1.1 behavior). Wired via SetUnparseableInserter.
+type UnparseableInserter interface {
+	InsertUnparseable(ctx context.Context, row postgres.Unparseable) error
+}
+
+// unparseableInsertTimeout bounds the per-message preservation insert.
+// Parse failures are best-effort — we'd rather ack-and-lose one
+// malformed message than block the subscriber goroutine on a slow
+// insert.
+const unparseableInsertTimeout = 5 * time.Second
+
 // Subscriber wires paho.golang/autopaho to the ring + WAL. Start blocks
 // until ctx is canceled.
 type Subscriber struct {
-	cfg    config.MQTTConfig
-	ring   Ring
-	wal    WAL
-	m      *metrics.SubscriberMetrics
-	logger *slog.Logger
+	cfg         config.MQTTConfig
+	ring        Ring
+	wal         WAL
+	unparseable UnparseableInserter
+	m           *metrics.SubscriberMetrics
+	logger      *slog.Logger
 
 	cm *autopaho.ConnectionManager
 
@@ -111,6 +126,14 @@ func New(cfg config.MQTTConfig, ring Ring, w WAL, m *metrics.SubscriberMetrics, 
 // ClientID returns the resolved client ID. Exported so tests can assert
 // stability across reconnects.
 func (s *Subscriber) ClientID() string { return s.clientID }
+
+// SetUnparseableInserter wires the side-table writer used to preserve
+// messages whose topic cannot be parsed. Pass nil (the default) to
+// keep the v0.1.1 behavior of log + ack + drop. Must be called before
+// Start.
+func (s *Subscriber) SetUnparseableInserter(u UnparseableInserter) {
+	s.unparseable = u
+}
 
 // Start connects, subscribes, and dispatches messages until ctx is done.
 // Returns the first error encountered while building the client; a
@@ -232,21 +255,13 @@ func (s *Subscriber) onPublish(pr paho.PublishReceived) (bool, error) {
 func (s *Subscriber) HandleMessage(topic string, payload []byte, ack func()) {
 	s.m.Received.Inc()
 
+	now := time.Now().UTC()
 	parsed, err := ParseTopic(topic)
 	if err != nil {
-		s.m.HandlerErrors.Inc()
-		s.logger.Warn("topic parse failed",
-			"event", "topic_parse_error",
-			"topic", topic,
-			"err", err.Error())
-		// Bad topic is unrecoverable; ack so the broker drops it.
-		if ack != nil {
-			ack()
-		}
+		s.handleParseFailure(topic, payload, err, now, ack)
 		return
 	}
 
-	now := time.Now().UTC()
 	msg := postgres.Message{
 		TenantID:   parsed.Tenant,
 		DeviceUUID: parsed.Device,
@@ -259,6 +274,60 @@ func (s *Subscriber) HandleMessage(topic string, payload []byte, ack func()) {
 		// Pause + WAL also full: do NOT ack; broker will redeliver.
 		return
 	}
+	if ack != nil {
+		ack()
+	}
+}
+
+// handleParseFailure runs when ParseTopic returns an error. It tries to
+// preserve the message in telemetry_unparseable (best-effort, single
+// insert with a short timeout) and always acks so the broker drops the
+// message — never NACK, since the same parse would fail again and the
+// queue would loop forever. See ADR 0006.
+func (s *Subscriber) handleParseFailure(topic string, payload []byte, err error, receivedAt time.Time, ack func()) {
+	s.m.HandlerErrors.Inc()
+
+	class := TopicErrStructure
+	detail := ""
+	var pe *TopicParseError
+	if errors.As(err, &pe) {
+		class = pe.Class
+		detail = pe.Detail
+	}
+
+	if s.unparseable != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), unparseableInsertTimeout)
+		defer cancel()
+		insErr := s.unparseable.InsertUnparseable(ctx, postgres.Unparseable{
+			Topic:       topic,
+			Payload:     append([]byte(nil), payload...),
+			ErrorClass:  class,
+			ErrorDetail: detail,
+			ReceivedAt:  receivedAt,
+		})
+		if insErr == nil {
+			s.m.UnparseableInserted.WithLabelValues(class).Inc()
+			s.logger.Info("preserved unparseable message",
+				"event", "unparseable_inserted",
+				"topic", topic,
+				"error_class", class)
+		} else {
+			s.m.UnparseableInsertErrors.Inc()
+			s.logger.Warn("failed to preserve unparseable message",
+				"event", "unparseable_insert_failed",
+				"topic", topic,
+				"error_class", class,
+				"err", insErr.Error())
+		}
+	} else {
+		s.logger.Warn("topic parse failed; dropping (no side-table writer configured)",
+			"event", "topic_parse_error",
+			"topic", topic,
+			"error_class", class,
+			"err", err.Error())
+	}
+
+	// Bad topic is unrecoverable; ack so the broker drops it.
 	if ack != nil {
 		ack()
 	}
